@@ -56,16 +56,22 @@ export type BrainAnalysis = {
   // for display so it's not mistaken for a calibrated probability.
   // Display this as "Technical score: X / 100" — NOT "X% probability".
   technical_score?: number | null;
-  // Phase 3.2: future statistical-probability fields — all NULL until
-  // Phase 4 implements historical pattern learning. Frontend renders
-  // placeholders for these today; real numbers come later without a
-  // breaking schema change.
+  // Phase 3.2 + Phase 4: historical statistics — populated by the
+  // historical similarity engine when there is sufficient same-instrument
+  // data. NULL when insufficient data exists. probability_calibrated is
+  // ALWAYS false in Phase 4 — calibration comes later.
   historical_sample_size?: number | null;
   historical_direction_rate?: number | null;
   historical_mfe?: number | null;          // maximum favorable excursion
   historical_mae?: number | null;          // maximum adverse excursion
   historical_probability?: number | null;
   probability_calibrated?: boolean | null;
+  // Phase 4: historical_alignment — informational only. Does NOT influence
+  // the BUY/SELL/WAIT decision (rules-v0.1 unchanged).
+  historical_alignment?: string | null;   // SUPPORTS | CONTRADICTS | NEUTRAL | INSUFFICIENT_DATA
+  historical_analogue_instrument?: string | null;  // "GC_FRONT_MONTH" — may differ from live instrument
+  historical_analogue_horizon_minutes?: number | null;
+  historical_analogue_note?: string | null;
 };
 
 export type Snapshot = {
@@ -250,4 +256,122 @@ export type BrainAnalysisExtras = {
   historical_depth: Record<string, number>;
   instrument_consistency: string;  // PURE_GC | PURE_SPOT | MIXED | NONE
   technical_data_readiness: number;
+};
+
+// ---------------------------------------------------------------------------
+// Phase 4: Historical pattern-learning types
+// ---------------------------------------------------------------------------
+
+export type DirectionRate = {
+  count: number;
+  rate: number;            // 0..1
+  wilson_lower: number;    // 0..1 (95% confidence interval)
+  wilson_upper: number;    // 0..1
+};
+
+export type HorizonStatistics = {
+  horizon_minutes: number;
+  sample_size: number;
+  up_count: number;
+  down_count: number;
+  neutral_count: number;
+  up_rate: DirectionRate;
+  down_rate: DirectionRate;
+  neutral_rate: DirectionRate;
+  median_return: number | null;
+  mean_return: number | null;
+  median_mfe: number | null;
+  median_mae: number | null;
+  mean_mfe: number | null;
+  mean_mae: number | null;
+  return_25th: number | null;
+  return_50th: number | null;
+  return_75th: number | null;
+  sample_quality: string;  // INSUFFICIENT | LOW | MODERATE | GOOD
+};
+
+export type AnalogFeatureSnapshot = {
+  trend: string | null;
+  market_regime: string | null;
+  rsi: number | null;
+  atr_pct: number | null;
+  swing_structure: string | null;
+  h1_direction: string | null;
+  h4_direction: string | null;
+  d1_direction: string | null;
+  session: string | null;
+  distance_to_support_atr: number | null;
+  distance_to_resistance_atr: number | null;
+  volatility_percentile: number | null;
+  timeframe_alignment_score: number | null;
+};
+
+export type NeighborMatch = {
+  state_id: number;
+  timestamp: string;
+  instrument: string;
+  similarity_score: number;        // 0..1
+  outcome_direction: string | null;  // UP | DOWN | NEUTRAL | NULL
+  outcome_future_price: number | null;
+  outcome_mfe: number | null;
+  outcome_mae: number | null;
+  outcome_percentage_change: number | null;
+  feature_snapshot: AnalogFeatureSnapshot;
+};
+
+export type CurrentSimilarityResult = {
+  instrument: string;
+  feature_version: string;
+  similarity_version: string;
+  horizon_minutes: number;
+  candidate_count: number;
+  sample_size: number;
+  current_state_timestamp: string;
+  current_state_price: number;
+  neighbors: NeighborMatch[];
+  statistics: HorizonStatistics | null;
+  historical_alignment: string | null;  // SUPPORTS | CONTRADICTS | NEUTRAL | INSUFFICIENT_DATA
+  technical_decision: string | null;
+  probability_calibrated: boolean;       // ALWAYS false in Phase 4
+  interpretation_note?: string;
+  error?: string;
+};
+
+export type LearningStatusByInstrument = {
+  instrument: string;
+  count: number;
+  earliest: string | null;
+  latest: string | null;
+};
+
+export type LearningStatusByHorizon = {
+  horizon_minutes: number;
+  total_outcomes: number;
+  valid_outcomes: number;
+};
+
+export type LearningRecentRun = {
+  id: number;
+  timestamp: string;
+  instrument: string;
+  feature_version: string;
+  similarity_version: string;
+  horizon_minutes: number;
+  candidate_count: number;
+  sample_size: number;
+  technical_decision: string | null;
+  historical_alignment: string | null;
+};
+
+export type LearningStatus = {
+  total_states: number;
+  total_outcomes: number;
+  by_instrument: LearningStatusByInstrument[];
+  by_base_timeframe: { base_timeframe: string; count: number }[];
+  by_horizon: LearningStatusByHorizon[];
+  recent_runs: LearningRecentRun[];
+  feature_version: string;
+  similarity_version: string;
+  probability_calibrated: boolean;
+  generated_at: string;
 };

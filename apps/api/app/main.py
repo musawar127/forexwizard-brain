@@ -21,6 +21,11 @@ from app.services.historical import (
     sync_historical_candles,
     timeframe_breakdown,
 )
+from app.services.learning import (
+    build_states as build_learning_states,
+    current_similarity,
+    learning_status,
+)
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
 from app.services.research import recent_research
@@ -297,6 +302,120 @@ async def data_sync(payload: DataSyncRequest | None = None):
         tfs = [t for t in tfs if t in INTERVALS]
     summary = await sync_historical_candles(symbol=symbol, timeframes=tfs)
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Historical pattern-learning endpoints
+#
+# These endpoints expose the historical similarity + outcome learning engine.
+# The Brain BUY/SELL/WAIT rules-v0.1 logic is UNCHANGED — historical statistics
+# are informational only. probability_calibrated is always False in Phase 4.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/learning/status")
+async def api_learning_status():
+    """Top-level learning engine status.
+
+    Returns: total historical states built, breakdowns by instrument / base
+    timeframe / horizon, recent similarity runs (audit log), and the
+    feature_version + similarity_version + probability_calibrated flags.
+    """
+    return await learning_status()
+
+
+@app.get("/api/learning/horizons")
+async def api_learning_horizons():
+    """Supported outcome horizons (15m / 30m / 1h / 2h / 4h / 8h / 24h)."""
+    from app.services.learning.config import HORIZON_MINUTES, NEUTRAL_X_DEFAULT
+    return {
+        "horizons_minutes": list(HORIZON_MINUTES),
+        "labels": {15: "15m", 30: "30m", 60: "1h", 120: "2h", 240: "4h", 480: "8h", 1440: "24h"},
+        "neutral_x_default": NEUTRAL_X_DEFAULT,
+        "probability_calibrated": False,
+    }
+
+
+@app.get("/api/learning/current-similarity")
+async def api_learning_current_similarity(
+    instrument: str = Query("GC_FRONT_MONTH"),
+    horizon: int = Query(60, ge=15, le=1440),
+    technical_decision: str | None = Query(None),
+):
+    """Find historical neighbors of the current market state for one
+    instrument + horizon. Returns top-10 analogs with outcome windows,
+    aggregated statistics with Wilson confidence intervals, and the
+    historical_alignment classification (SUPPORTS / CONTRADICTS / NEUTRAL
+    / INSUFFICIENT_DATA) — informational only, does NOT influence the
+    technical decision.
+
+    Instrument is REQUIRED to match exactly — GC_FRONT_MONTH states only
+    match against GC_FRONT_MONTH candidates. Never combine with
+    XAUUSD_SPOT statistics.
+    """
+    if instrument not in {"GC_FRONT_MONTH", "XAUUSD_SPOT"}:
+        raise HTTPException(status_code=400, detail="instrument must be GC_FRONT_MONTH or XAUUSD_SPOT")
+    valid_horizons = {15, 30, 60, 120, 240, 480, 1440}
+    if horizon not in valid_horizons:
+        raise HTTPException(status_code=400, detail=f"horizon must be one of {sorted(valid_horizons)}")
+    return await current_similarity(
+        instrument=instrument,
+        horizon_minutes=horizon,
+        technical_decision=technical_decision,
+    )
+
+
+@app.get("/api/learning/analogs")
+async def api_learning_analogs(
+    instrument: str = Query("GC_FRONT_MONTH"),
+    horizon: int = Query(60, ge=15, le=1440),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """Top-N closest historical analogs. Capped at 50 to prevent
+    uncontrolled large queries."""
+    result = await current_similarity(instrument=instrument, horizon_minutes=horizon)
+    return {
+        "instrument": instrument,
+        "horizon_minutes": horizon,
+        "analogs": (result.get("neighbors") or [])[:limit],
+        "candidate_count": result.get("candidate_count", 0),
+        "sample_size": result.get("sample_size", 0),
+    }
+
+
+class BuildStatesRequest(BaseModel):
+    """POST /api/learning/build-states body.
+
+    Restrictive: callers cannot pick an arbitrary instrument other than
+    the canonical XAU/USD futures (GC_FRONT_MONTH) or spot (XAUUSD_SPOT).
+    The base timeframe is pinned to H1 (deepest intraday native history).
+    """
+
+    instrument: str = "GC_FRONT_MONTH"
+    batch_limit: int = 5000
+    clear_existing: bool = False
+
+
+@app.post("/api/learning/build-states")
+async def api_learning_build_states(payload: BuildStatesRequest | None = None):
+    """Trigger a batch build of historical market states + outcomes.
+
+    Single-shot — safe to call repeatedly (already-built states are
+    skipped idempotently). Clears existing states first only if
+    `clear_existing=true` is passed in the body.
+
+    No arbitrary uncontrolled downloads: instrument is pinned to
+    GC_FRONT_MONTH or XAUUSD_SPOT. batch_limit caps the build size.
+    """
+    p = payload or BuildStatesRequest()
+    if p.instrument not in {"GC_FRONT_MONTH", "XAUUSD_SPOT"}:
+        raise HTTPException(status_code=400, detail="instrument must be GC_FRONT_MONTH or XAUUSD_SPOT")
+    if not (1 <= p.batch_limit <= 10000):
+        raise HTTPException(status_code=400, detail="batch_limit must be 1-10000")
+    return await build_learning_states(
+        instrument=p.instrument,
+        batch_limit=p.batch_limit,
+        clear_existing=p.clear_existing,
+    )
 
 
 @app.websocket("/ws/market")

@@ -97,12 +97,26 @@ class BrainAnalysis(BaseModel):
     # are exposed in the API so the frontend can render placeholders
     # ("Not yet calculated — Phase 4") today and real numbers later
     # without breaking the response schema.
+    # Phase 4: these fields are now POPULATED by the historical similarity
+    # engine when there is sufficient same-instrument historical data.
+    # probability_calibrated is ALWAYS False in Phase 4 — calibration
+    # is a future phase.
     historical_sample_size: int | None = None
     historical_direction_rate: float | None = None
     historical_mfe: float | None = None
     historical_mae: float | None = None
     historical_probability: float | None = None
     probability_calibrated: bool | None = None
+    # Phase 4: historical_alignment — informational only. SUPPORTS /
+    # CONTRADICTS / NEUTRAL / INSUFFICIENT_DATA. Does NOT influence the
+    # BUY/SELL/WAIT decision (rules-v0.1 unchanged).
+    historical_alignment: str | None = None
+    # Phase 4: which instrument the historical statistics came from.
+    # May differ from the live instrument (e.g. live=XAUUSD_SPOT,
+    # historical_analogue_instrument=GC_FRONT_MONTH).
+    historical_analogue_instrument: str | None = None
+    historical_analogue_horizon_minutes: int | None = None
+    historical_analogue_note: str | None = None
 
 
 class AskRequest(BaseModel):

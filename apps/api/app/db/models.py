@@ -203,3 +203,138 @@ class NewsRecord(Base):
     source_country: Mapped[str | None] = mapped_column(String(64), nullable=True)
     topic: Mapped[str] = mapped_column(String(255), default="gold")
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+# ===========================================================================
+# Phase 4: Historical pattern-learning engine
+#
+# Three tables back the learning layer:
+#   1. historical_market_states — one row per (instrument, base_tf, ts) with
+#      the full feature vector computed from candles <= ts (NO look-ahead).
+#   2. historical_outcomes — one row per (state_id, horizon_minutes) with the
+#      future_price/MFE/MAE/direction computed from candles >= ts (forward-only).
+#   3. similarity_runs — audit log of every live similarity run.
+#
+# Outcome windows are SEPARATE from state features so we never accidentally
+# leak future information back into the feature vector.
+# ===========================================================================
+
+
+class HistoricalMarketState(Base):
+    """Phase 4: a single historical market-state snapshot at time T.
+
+    All features (EMA, RSI, ATR, trend, regime, support/resistance,
+    swing structure, volatility percentile, multi-TF direction,
+    alignment, session) are computed from candles with timestamp <= T.
+    Absolutely no look-ahead — features describe the world AS IT WAS at
+    time T, before any future candle existed.
+
+    feature_version + similarity_version persist the versioning so we
+    can rebuild cleanly when feature engineering changes.
+    """
+
+    __tablename__ = "historical_market_states"
+    __table_args__ = (
+        UniqueConstraint("instrument", "base_timeframe", "timestamp", name="uq_hist_state_inst_tf_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str] = mapped_column(String(64))
+    provider_symbol: Mapped[str] = mapped_column(String(32))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    base_timeframe: Mapped[str] = mapped_column(String(16), index=True)
+    price: Mapped[float] = mapped_column(Float)
+
+    # Normalized continuous features
+    ema_fast: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ema_slow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ema_distance_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # (fast-slow)/slow * 100
+    rsi: Mapped[float | None] = mapped_column(Float, nullable=True)               # 0..100
+    atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    atr_pct: Mapped[float | None] = mapped_column(Float, nullable=True)            # atr / price * 100
+
+    # Categorical features (stored as strings for inspection)
+    trend: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    market_regime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # ATR-normalized distances (continuous, scale-free)
+    distance_to_support_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    distance_to_resistance_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Swing structure classification
+    swing_structure: Mapped[str | None] = mapped_column(String(32), nullable=True)  # HH_HL / LH_LL / etc.
+    higher_high: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    higher_low: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    lower_high: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    lower_low: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # Volatility context (0-100 percentile rank within recent history)
+    volatility_percentile: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session: Mapped[str | None] = mapped_column(String(16), nullable=True)  # ASIA / EU / US / OFF
+
+    # Multi-timeframe direction (computed from each TF's trend at T)
+    h1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    h4_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    d1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timeframe_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0..1
+
+    # Source quality: HEALTHY / DEGRADED / INVALID based on data around T
+    source_quality: Mapped[str] = mapped_column(String(16), default="HEALTHY")
+
+    # Versioning — mandatory so we can rebuild when feature engineering changes
+    feature_version: Mapped[str] = mapped_column(String(16), default="features-v0.1")
+    similarity_version: Mapped[str] = mapped_column(String(16), default="similarity-v0.1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class HistoricalOutcome(Base):
+    """Phase 4: outcome window for a historical state at one horizon.
+
+    Computed strictly from candles with timestamp >= state.timestamp.
+    NEVER used to influence the feature vector at the state's own time
+    (would be look-ahead leakage).
+
+    direction is UP / DOWN / NEUTRAL based on a volatility-aware
+    threshold (X * ATR). X is configurable; default X = 0.5 (conservative).
+    """
+
+    __tablename__ = "historical_outcomes"
+    __table_args__ = (
+        UniqueConstraint("state_id", "horizon_minutes", name="uq_hist_outcome_state_h"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    state_id: Mapped[int] = mapped_column(Integer, index=True)
+    horizon_minutes: Mapped[int] = mapped_column(Integer, index=True)
+    future_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    absolute_change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    percentage_change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe: Mapped[float | None] = mapped_column(Float, nullable=True)  # max favorable excursion
+    mae: Mapped[float | None] = mapped_column(Float, nullable=True)  # max adverse excursion
+    maximum_up_move: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maximum_down_move: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)  # UP / DOWN / NEUTRAL / NULL
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SimilarityRun(Base):
+    """Phase 4: audit log of every live similarity run.
+
+    Lets us later evaluate whether historical similarity actually helps —
+    by comparing technical decisions against historical evidence over time.
+    """
+
+    __tablename__ = "similarity_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True)
+    feature_version: Mapped[str] = mapped_column(String(16))
+    similarity_version: Mapped[str] = mapped_column(String(16))
+    horizon_minutes: Mapped[int] = mapped_column(Integer)
+    candidate_count: Mapped[int] = mapped_column(Integer)
+    sample_size: Mapped[int] = mapped_column(Integer)
+    result_statistics_json: Mapped[str] = mapped_column(Text)        # JSON: up_rate, down_rate, neutral_rate, etc.
+    technical_decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    historical_alignment: Mapped[str | None] = mapped_column(String(32), nullable=True)  # SUPPORTS/CONTRADICTS/NEUTRAL/INSUFFICIENT_DATA

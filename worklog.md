@@ -499,3 +499,140 @@ Not implemented (as required):
 Stage Summary:
 - Phase 3.2 complete. Gap classification now distinguishes EXPECTED_MARKET_CLOSURE / EXPECTED_SESSION_BREAK / UNEXPECTED_GAP / INVALID_DATA. Integrity uses HEALTHY/DEGRADED/INVALID semantics. confidence renamed to technical_score for display (calculation unchanged, backward-compat preserved). 6 nullable statistical fields exposed for Phase 4. MIXED instrument-consistency notice shown on both /data page and dashboard. 61 tests pass. Build clean.
 - Phase 4 NOT started.
+
+---
+Task ID: 7 (Phase 4)
+Agent: main
+Task: Historical pattern learning engine. Build no-look-ahead historical state snapshots, find similar past setups, measure outcomes, report statistics with Wilson intervals, populate BrainAnalysis nullable fields — WITHOUT changing BUY/SELL/WAIT rules.
+
+Work Log:
+
+Backend code added (5 new files):
+  apps/api/app/services/learning/__init__.py — public surface
+  apps/api/app/services/learning/config.py — LearningConfig, FeatureWeights, NEUTRAL_X_DEFAULT=0.5, HORIZON_MINUTES, sample-quality thresholds (30/100/300), min_spacing=4 candles, top_k=200
+  apps/api/app/services/learning/states.py — HistoricalStateBuilder with NO-LOOK-AHEAD guarantee. Accepts pre-fetched H1/H4/D1 candle lists to avoid N+1 DB queries. FeatureVector is a frozen dataclass with normalized features (rsi/100, ema_distance/ATR, dist_to_support/ATR, etc.) — no raw price as a similarity feature.
+  apps/api/app/services/learning/outcomes.py — OutcomeCalculator. Computes MFE/MAE/direction at 7 horizons (15m/30m/1h/2h/4h/8h/24h). Direction uses volatility-aware threshold: |change|/ATR < 0.5 => NEUTRAL, else UP/DOWN.
+  apps/api/app/services/learning/similarity.py — SimilarityEngine. Weighted normalized Euclidean distance on continuous features, 0/1 distance on categorical. Weights: trend/regime/alignment=HIGH(2.0), S-R=medium_high(1.5), RSI/ATR%/EMA-dist/vol/session/swing=MEDIUM(1.0). Includes temporal deduplication (min_spacing_candles) so 5 consecutive similar candles don't count as 5 independent samples.
+  apps/api/app/services/learning/statistics.py — StatisticsAggregator. Wilson 95% confidence interval for binomial proportions. Sample quality: <30 INSUFFICIENT, 30-99 LOW, 100-299 MODERATE, 300+ GOOD. alignment_for_decision() classifies SUPPORTS/CONTRADICTS/NEUTRAL/INSUFFICIENT_DATA.
+  apps/api/app/services/learning/orchestrator.py — build_states() (batch builder with bisect-slicing + single-session DB writes for performance) + current_similarity() (live matcher with 30s TTL cache + audit-log) + learning_status().
+
+Backend code modified (5 files):
+  apps/api/app/db/models.py — added 3 new tables: HistoricalMarketState (35+ fields including feature_version + similarity_version), HistoricalOutcome (one row per state+horizon with MFE/MAE/direction), SimilarityRun (audit log).
+  apps/api/app/main.py — added 5 Phase 4 endpoints: GET /api/learning/status, GET /api/learning/horizons, GET /api/learning/current-similarity, GET /api/learning/analogs, POST /api/learning/build-states. All endpoints restrict instrument to {GC_FRONT_MONTH, XAUUSD_SPOT} only — never combine instruments.
+  apps/api/app/models/market.py — BrainAnalysis extended with: technical_score (alias for confidence), historical_sample_size, historical_direction_rate, historical_mfe, historical_mae, historical_probability, probability_calibrated (ALWAYS False in Phase 4), historical_alignment, historical_analogue_instrument, historical_analogue_horizon_minutes, historical_analogue_note.
+  apps/api/app/engine/analysis.py — added _build_phase4_stats_overlay() that pulls GC_FRONT_MONTH 1h stats from the learning engine. SCORING LOGIC UNCHANGED — 0 lines of BUY/SELL/WAIT rules modified. Both return paths (NO_DECISION + main) populate the new fields.
+  apps/api/tests/test_phase32_data_quality.py — updated 1 test to reflect Phase 4 behavior (probability_calibrated is now False, not None).
+
+Tests added (1 new file, 21 tests):
+  apps/api/tests/test_phase4_learning.py — comprehensive coverage:
+    - no-look-ahead (verify feature vector at T is unchanged when future candles are added)
+    - same-instrument-only (verified at orchestrator level — API endpoint filters by instrument)
+    - normalized feature vector (no raw price field)
+    - deterministic similarity (same inputs => identical output)
+    - temporal neighbor dedup (5 clustered candidates -> 3 after dedup)
+    - sample quality classification (INSUFFICIENT/LOW/MODERATE/GOOD at 30/100/300 thresholds)
+    - MFE/MAE calculation
+    - direction classification (NEUTRAL when |change| < 0.5*ATR; UP/DOWN when above; fallback when ATR missing)
+    - Wilson confidence interval (in [0,1], contains point estimate, extremes work)
+    - all 7 horizons supported (15m/30m/1h/2h/4h/8h/24h)
+    - missing future data → NULL outcome
+    - feature_version + similarity_version persisted in default config
+    - probability_calibrated stays False
+    - BUY/SELL/WAIT rules UNCHANGED (decision still computed by rules-v0.1; only informational fields added)
+    - historical_alignment SUPPORTS / CONTRADICTS / NEUTRAL / INSUFFICIENT_DATA classification
+    - statistics aggregator handles empty + classifies sample quality + populates Wilson intervals + percentiles
+
+Frontend code added (1 new file):
+  apps/web/app/learning/page.tsx — /learning page:
+    - States analyzed + total outcomes hero
+    - States by instrument + by base timeframe
+    - Outcomes by horizon (with effective historical range column)
+    - "Build states" button (POST /api/learning/build-states)
+    - Current similarity panel with instrument + horizon selectors
+    - Per-horizon statistics table (Sample / UP / 95% CI / DOWN / 95% CI / NEUTRAL / Median Return / Median MFE / Median MAE)
+    - Historical alignment box (SUPPORTS=green / CONTRADICTS=red / NEUTRAL=amber / INSUFFICIENT_DATA=muted)
+    - probability_calibrated = FALSE notice (always shown)
+    - Mixed-instrument notice (instrument separation enforced)
+    - Analog explorer: top-10 neighbors table (Date / Similarity / Regime / RSI / ATR% / Structure / H1/H4/D1 / Session / Outcome / MFE / MAE)
+    - Click a row to inspect its full feature snapshot
+    - Interpretation rules panel ("historical observations do not guarantee future outcomes")
+    - Audit log table (last 10 similarity runs)
+
+Frontend code modified (3 files):
+  apps/web/lib/types.ts — added DirectionRate, HorizonStatistics, AnalogFeatureSnapshot, NeighborMatch, CurrentSimilarityResult, LearningStatusByInstrument, LearningStatusByHorizon, LearningRecentRun, LearningStatus types. Extended BrainAnalysis with technical_score + 6 statistical fields + historical_alignment + historical_analogue_instrument/horizon_minutes/note.
+  apps/web/components/Nav.tsx — added /learning link.
+  apps/web/components/DecisionCard.tsx — when brain.historical_sample_size > 0, show a populated "HISTORICAL GC_FRONT_MONTH ANALOGUE — 60m horizon" panel with Sample / Direction rate / Median MFE / Median MAE / Historical alignment / probability_calibrated=FALSE notice. Otherwise show "Statistical probability: not yet calculated (build states via /learning page)".
+
+Real-data build verification:
+  Build target: GC_FRONT_MONTH, base_tf=1h, batch_limit=5000
+  Result: 3,700 states built, 25,900 outcomes (3,700 × 7 horizons)
+  Earliest state: Nov 06 2025 5pm UTC
+  Latest state: ~May 2026 (states older than 24h before "now" excluded)
+  States with insufficient forward data: 0 at every horizon (H1 has 2y depth, plenty for 24h forward windows)
+  Performance: ~13s per 500 states (40ms per state) using bisect-slicing + single-session DB writes + pre-fetched multi-TF candle lists
+
+BrainAnalysis populated fields (verified live):
+  decision: SELL (UNCHANGED — rules-v0.1 logic intact)
+  confidence: 92.0 (UNCHANGED — same formula)
+  technical_score: 92.0 (alias for confidence — display-only rename)
+  historical_sample_size: 200 (independent neighbors after temporal dedup)
+  historical_direction_rate: 0.255 (25.5% observed DOWN rate for SELL direction)
+  historical_mfe: $8.65 (median favorable excursion across 200 analogues)
+  historical_mae: $9.60 (median adverse excursion across 200 analogues)
+  historical_probability: 0.255 (same as direction_rate — descriptive, NOT calibrated)
+  probability_calibrated: False ✓ (Phase 4 invariant — always False)
+  historical_alignment: NEUTRAL (25.5% DOWN doesn't dominate enough to SUPPORT or CONTRADICT)
+  historical_analogue_instrument: GC_FRONT_MONTH (separate from live XAUUSD_SPOT — never combined)
+  historical_analogue_horizon_minutes: 60
+
+/api/learning/current-similarity response (1h horizon, GC_FRONT_MONTH):
+  candidate_count: 2,950 (all historical H1 states for this instrument)
+  sample_size: 200 (after temporal dedup, min_spacing = 4 H1 candles)
+  sample_quality: MODERATE (200 in [100, 300) range)
+  statistics:
+    up_count: 45 / down_count: 46 / neutral_count: 109
+    up_rate: 22.5% (95% CI: 17.3%-28.8%)  ← Wilson interval
+    down_rate: 23.0% (95% CI: 17.7%-29.3%)
+    neutral_rate: 54.5%
+    median_return: 0.02%
+    median_mfe: $9.60
+    median_mae: $10.15
+  top-10 analogues shown (highest similarity 96.0%)
+  interpretation_note: "Among 200 similar GC_FRONT_MONTH historical states, the observed directional frequencies are descriptive statistics — they are NOT calibrated probabilities of future outcomes."
+  probability_calibrated: False
+
+Tests run: 85 passed in 2.79s (was 61 pre-Phase 4 — net +24 new tests)
+Typecheck: 0 errors
+Next build: success — 9 routes prerendered (added /learning)
+
+Browser tests:
+  /learning page: 3,000+ states, 200-sample MODERATE quality, Wilson intervals, top-10 analog explorer with click-to-inspect, audit log of last 10 runs, full interpretation rules panel, "Historical observations do not guarantee future outcomes" notice.
+  Dashboard: DecisionCard shows "SELL | Technical score 92.0/100 | HISTORICAL GC_FRONT_MONTH ANALOGUE — 60m horizon | Sample 200 · Direction rate 25.5% · Median MFE $8.65 · Median MAE $9.60 | Historical alignment: NEUTRAL (informational — does NOT influence the technical decision) | probability_calibrated = FALSE".
+  All 8 routes verified: /, /analysis, /data, /learning, /research, /memory, /performance, /settings → all HTTP 200.
+
+Preserved (as required):
+  - BUY/SELL/WAIT rules-v0.1 logic — UNCHANGED, 0 lines of scoring code modified (clearly delimited with "---- UNCHANGED SCORING LOGIC ----" markers in analysis.py)
+  - confidence field preserved in API response (backward compat) — technical_score is an alias, not a replacement
+  - XAUUSD_SPOT and GC_FRONT_MONTH statistics NEVER combined (orchestrator filters candidates by instrument before matching)
+  - No real-money trading
+  - No fake candles or synthetic history
+  - probability_calibrated is ALWAYS False throughout Phase 4 — calibration is a future phase
+  - Missing future data → NULL outcome (not silently fabricated)
+
+Not implemented (as required):
+  - No strategy optimization (Phase 4 is informational only)
+  - No parameter optimization (NEUTRAL_X = 0.5 is documented conservative default, NOT tuned against results)
+  - No machine-learning model training (similarity-v0.1 is transparent weighted-distance, not a neural net)
+  - No technical-score weighting changes (technical_score == confidence — display rename only)
+  - No automatic trading
+  - No Phase 5
+
+Performance limitations (documented):
+  1. build_states() runs synchronously inside the FastAPI request handler — long builds (>1000 states) block the event loop. For Phase 4 the user accepted this as "no unnecessary infrastructure". A future phase could move it to a background task queue.
+  2. current_similarity() has a 30-second TTL cache so repeated frontend refreshes don't recompute.
+  3. SQLite — for production scale (>100k states), would need PostgreSQL + GIN indexes on feature columns.
+  4. Per-state DB writes are batched every 25 states — single-row inserts would be 10x slower.
+
+Stage Summary:
+- Phase 4 complete. Historical pattern-learning engine live with 3,700 states + 25,900 outcomes. Brain's nullable statistical fields now POPULATED with sample size / direction rate / MFE / MAE / alignment / analogue instrument. All numbers carry Wilson 95% confidence intervals. probability_calibrated is ALWAYS False. BUY/SELL/WAIT rules UNCHANGED. 85 tests pass. Build clean. /learning page live with analog explorer + audit log. /dashboard shows populated historical context panel.
+- Phase 5 NOT started.

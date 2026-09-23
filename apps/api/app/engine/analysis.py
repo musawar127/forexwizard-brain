@@ -199,12 +199,19 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
             instrument_consistency=instrument_consistency,
             technical_data_readiness=readiness,
             technical_score=0.0,
+            # Phase 4: NO_DECISION → no directional statistics to populate.
+            # All historical fields remain None until the Brain can produce
+            # a directional decision worth measuring.
             historical_sample_size=None,
             historical_direction_rate=None,
             historical_mfe=None,
             historical_mae=None,
             historical_probability=None,
-            probability_calibrated=None,
+            probability_calibrated=False,
+            historical_alignment="INSUFFICIENT_DATA",
+            historical_analogue_instrument=None,
+            historical_analogue_horizon_minutes=None,
+            historical_analogue_note=None,
         )
 
     # Select the richest locally accumulated timeframe for nearby zones.
@@ -295,6 +302,12 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
     else:
         message = "Experimental rules-based setup detected. This is evidence-based analysis, not a guarantee of future price direction."
 
+    # Phase 4: populate the nullable statistical fields from the historical
+    # similarity engine — INFORMATIONAL ONLY. The BUY/SELL/WAIT decision is
+    # unchanged (rules-v0.1). historical_alignment does NOT influence the
+    # decision. probability_calibrated stays False throughout Phase 4.
+    stats_payload = await _build_phase4_stats_overlay(decision)
+
     return BrainAnalysis(
         timestamp=now,
         decision=decision,
@@ -318,14 +331,62 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         # Phase 3.2: technical_score is the SAME value as confidence —
         # renamed for display so it's not mistaken for a probability.
         technical_score=round(confidence, 1),
-        # Phase 3.2: statistical-probability fields remain NULL until
-        # Phase 4 implements historical pattern learning. They are
-        # exposed in the API so the frontend can render placeholders
-        # today without breaking the response schema.
-        historical_sample_size=None,
-        historical_direction_rate=None,
-        historical_mfe=None,
-        historical_mae=None,
-        historical_probability=None,
-        probability_calibrated=None,
+        # Phase 4: populated historical statistics (or None if insufficient data).
+        historical_sample_size=stats_payload.get("historical_sample_size"),
+        historical_direction_rate=stats_payload.get("historical_direction_rate"),
+        historical_mfe=stats_payload.get("historical_mfe"),
+        historical_mae=stats_payload.get("historical_mae"),
+        historical_probability=stats_payload.get("historical_probability"),
+        probability_calibrated=False,  # ALWAYS False in Phase 4 — calibration is later
+        historical_alignment=stats_payload.get("historical_alignment"),
+        historical_analogue_instrument=stats_payload.get("historical_analogue_instrument"),
+        historical_analogue_horizon_minutes=stats_payload.get("historical_analogue_horizon_minutes"),
+        historical_analogue_note=stats_payload.get("historical_analogue_note"),
     )
+
+
+async def _build_phase4_stats_overlay(technical_decision: str) -> dict:
+    """Phase 4: informational overlay — pull historical similarity stats
+    for the GC_FRONT_MONTH instrument at the 1h horizon. Does NOT
+    influence the BUY/SELL/WAIT decision. Returns empty dict on any
+    error so the Brain never breaks if the learning layer is offline.
+    """
+    try:
+        from app.services.learning import current_similarity
+        result = await current_similarity(
+            instrument="GC_FRONT_MONTH",
+            horizon_minutes=60,
+            technical_decision=technical_decision,
+        )
+        stats = result.get("statistics") or {}
+        # historical_direction_rate = observed rate of the Brain's current
+        # technical direction (BUY→UP rate, SELL→DOWN rate, WAIT→NEUTRAL rate).
+        direction_rate = None
+        if technical_decision == "BUY":
+            direction_rate = stats.get("up_rate", {}).get("rate")
+        elif technical_decision == "SELL":
+            direction_rate = stats.get("down_rate", {}).get("rate")
+        elif technical_decision == "WAIT":
+            direction_rate = stats.get("neutral_rate", {}).get("rate")
+        return {
+            "historical_sample_size": result.get("sample_size"),
+            "historical_direction_rate": direction_rate,
+            "historical_mfe": stats.get("median_mfe"),
+            "historical_mae": stats.get("median_mae"),
+            # historical_probability = the observed directional rate (NOT a
+            # calibrated probability). The frontend MUST phrase this as
+            # "Among N similar GC futures historical states, X% produced a
+            # <direction> outcome" — NOT "X% probability of success".
+            "historical_probability": direction_rate,
+            "historical_alignment": result.get("historical_alignment"),
+            "historical_analogue_instrument": "GC_FRONT_MONTH",
+            "historical_analogue_horizon_minutes": 60,
+            "historical_analogue_note": (
+                "Historical analogue instrument: GC_FRONT_MONTH (Yahoo gold futures). "
+                "Live instrument may be XAUUSD_SPOT — these are SEPARATE instruments. "
+                "Statistics are descriptive observations of similar past states, not "
+                "calibrated probabilities of future outcomes."
+            ),
+        }
+    except Exception:
+        return {}
