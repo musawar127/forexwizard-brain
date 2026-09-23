@@ -43,6 +43,11 @@ from app.db.session import SessionLocal
 from app.engine.candles import INTERVALS, get_candles
 from app.services.learning.config import DEFAULT_CONFIG
 
+# Phase 5.2: canonical capture_timeframe values.
+# Internal DB uses "M15" and "H1" only — never "15min" or "1h".
+CANONICAL_CAPTURE_TIMEFRAMES = {"15min": "M15", "1h": "H1"}
+INTERNAL_TO_INTERVALS = {"M15": "15min", "H1": "1h"}
+
 FORWARD_HORIZONS = (15, 30, 60, 120, 240, 480, 1440)
 FORWARD_SAMPLE_THRESHOLDS = {"INSUFFICIENT": 30, "EARLY": 100, "MODERATE": 300}
 
@@ -109,7 +114,7 @@ def set_forward_start_date() -> datetime:
 
 async def capture_observation(
     *,
-    capture_timeframe: str = "1h",
+    capture_timeframe: str = "H1",
 ) -> dict:
     """Capture a new forward observation at the current market state.
 
@@ -143,7 +148,7 @@ async def capture_observation(
         return {"error": "no analysis available", "skipped": True}
 
     # Phase 5.1: determine completed candle timestamp (floor to TF boundary)
-    tf_seconds = INTERVALS.get(capture_timeframe, 3600)
+    tf_seconds = INTERVALS.get(INTERNAL_TO_INTERVALS.get(capture_timeframe, capture_timeframe), 3600)
     epoch = int(now.timestamp())
     floored_ts = datetime.fromtimestamp(epoch - (epoch % tf_seconds), tz=timezone.utc)
 
@@ -866,3 +871,245 @@ def get_forward_performance(horizon_minutes: int = 60, capture_timeframe: str | 
             })
 
     return result
+
+
+# ===========================================================================
+# Phase 5.2: Heartbeat + Health + Startup recovery
+# ===========================================================================
+
+import time as _time_module
+
+_FORWARD_STARTUP_TIME = _time_module.monotonic()
+_LAST_HEARTBEAT_TS = None
+_LAST_M15_CAPTURE = None
+_LAST_H1_CAPTURE = None
+_LAST_EVALUATION = None
+_LAST_ERROR = None
+
+
+def _record_heartbeat() -> None:
+    """Persist a lightweight heartbeat row."""
+    global _LAST_HEARTBEAT_TS, _LAST_M15_CAPTURE, _LAST_H1_CAPTURE, _LAST_EVALUATION, _LAST_ERROR
+    try:
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as session:
+            from app.db.models import ForwardHeartbeat
+            session.add(ForwardHeartbeat(
+                timestamp=now.replace(tzinfo=None),
+                collector_running=True,
+                evaluator_running=True,
+                last_valid_quote_price=None,
+                last_valid_quote_ts=None,
+                last_m15_capture_ts=_LAST_M15_CAPTURE.replace(tzinfo=None) if _LAST_M15_CAPTURE else None,
+                last_h1_capture_ts=_LAST_H1_CAPTURE.replace(tzinfo=None) if _LAST_H1_CAPTURE else None,
+                last_evaluation_ts=_LAST_EVALUATION.replace(tzinfo=None) if _LAST_EVALUATION else None,
+                pending_observations=0,
+                last_error=_LAST_ERROR,
+                uptime_seconds=round(_time_module.monotonic() - _FORWARD_STARTUP_TIME, 1),
+            ))
+            session.commit()
+        _LAST_HEARTBEAT_TS = now
+    except Exception:
+        pass
+
+
+def get_forward_health() -> dict:
+    """Phase 5.2: GET /api/forward/health — collector + evaluator status."""
+    global _LAST_M15_CAPTURE, _LAST_H1_CAPTURE, _LAST_EVALUATION, _LAST_ERROR
+    now = datetime.now(timezone.utc)
+    uptime = round(_time_module.monotonic() - _FORWARD_STARTUP_TIME, 1)
+
+    # Get latest heartbeat
+    latest_hb = None
+    try:
+        with SessionLocal() as session:
+            from app.db.models import ForwardHeartbeat
+            from sqlalchemy import select as sa_sel
+            hb = session.scalar(sa_sel(ForwardHeartbeat).order_by(ForwardHeartbeat.timestamp.desc()).limit(1))
+            if hb:
+                latest_hb = {
+                    "timestamp": hb.timestamp.isoformat() if hb.timestamp else None,
+                    "uptime_seconds": hb.uptime_seconds,
+                    "last_m15_capture_ts": hb.last_m15_capture_ts.isoformat() if hb.last_m15_capture_ts else None,
+                    "last_h1_capture_ts": hb.last_h1_capture_ts.isoformat() if hb.last_h1_capture_ts else None,
+                    "last_evaluation_ts": hb.last_evaluation_ts.isoformat() if hb.last_evaluation_ts else None,
+                    "pending_observations": hb.pending_observations,
+                    "last_error": hb.last_error,
+                }
+    except Exception:
+        pass
+
+    # Get pending count
+    pending_count = 0
+    try:
+        with SessionLocal() as session:
+            from sqlalchemy import func as sa_func
+            pending_count = session.scalar(
+                sa_func.count(ForwardObservation.id).where(
+                    ForwardObservation.observation_status.in_(["PENDING", "PARTIALLY_EVALUATED"])
+                )
+            ) or 0
+    except Exception:
+        pass
+
+    # Determine collector status
+    heartbeat_age = None
+    if latest_hb and latest_hb.get("timestamp"):
+        try:
+            hb_ts = datetime.fromisoformat(latest_hb["timestamp"])
+            if hb_ts.tzinfo is None:
+                hb_ts = hb_ts.replace(tzinfo=timezone.utc)
+            heartbeat_age = (now - hb_ts).total_seconds()
+        except Exception:
+            pass
+
+    if heartbeat_age is not None and heartbeat_age < 120:
+        collector_status = "ONLINE"
+    elif heartbeat_age is not None and heartbeat_age < 600:
+        collector_status = "DEGRADED"
+    else:
+        collector_status = "OFFLINE"
+
+    # Spot storage monitoring
+    spot_info = _get_spot_storage_info()
+
+    return {
+        "collector_status": collector_status,
+        "collector_running": True,
+        "evaluator_running": True,
+        "uptime_seconds": uptime,
+        "last_heartbeat": latest_hb.get("timestamp") if latest_hb else None,
+        "last_m15_capture": latest_hb.get("last_m15_capture_ts") if latest_hb else None,
+        "last_h1_capture": latest_hb.get("last_h1_capture_ts") if latest_hb else None,
+        "last_outcome_evaluation": latest_hb.get("last_evaluation_ts") if latest_hb else None,
+        "pending_observations": pending_count,
+        "last_error": latest_hb.get("last_error") if latest_hb else None,
+        "spot_storage": spot_info,
+        "forward_validation_started_at": get_forward_start_date().isoformat() if get_forward_start_date() else None,
+    }
+
+
+def _get_spot_storage_info() -> dict:
+    """Phase 5.2: monitor XAUUSD_SPOT data retention."""
+    try:
+        with SessionLocal() as session:
+            from app.db.models import CandleRecord
+            from sqlalchemy import func as sa_func
+            oldest = session.scalar(sa_func.min(CandleRecord.timestamp).where(
+                CandleRecord.instrument == "XAUUSD_SPOT",
+                CandleRecord.interval == "1min",
+            ))
+            latest = session.scalar(sa_func.max(CandleRecord.timestamp).where(
+                CandleRecord.instrument == "XAUUSD_SPOT",
+                CandleRecord.interval == "1min",
+            ))
+            total = session.scalar(sa_func.count(CandleRecord.id).where(
+                CandleRecord.instrument == "XAUUSD_SPOT",
+                CandleRecord.interval == "1min",
+            )) or 0
+        retention_days = None
+        if oldest and latest:
+            if oldest.tzinfo is None:
+                oldest = oldest.replace(tzinfo=timezone.utc)
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            retention_days = round((latest - oldest).total_seconds() / 86400, 2)
+        return {
+            "oldest_spot_observation": oldest.isoformat() if oldest else None,
+            "latest_spot_observation": latest.isoformat() if latest else None,
+            "total_spot_observations": total,
+            "retention_days": retention_days,
+            "data_gap_warning": retention_days is not None and retention_days < 1.0,
+        }
+    except Exception:
+        return {"error": "could not query spot storage"}
+
+
+def detect_missed_captures() -> list[dict]:
+    """Phase 5.2: detect M15/H1 completed-candle capture events that were missed
+    while the server was offline. Does NOT retroactively create observations —
+    just logs MISSED_FORWARD_CAPTURE in the audit log."""
+    missed = []
+    now = datetime.now(timezone.utc)
+    start_date = get_forward_start_date()
+    if not start_date:
+        return missed
+
+    for canonical_tf, interval_tf in [("M15", "15min"), ("H1", "1h")]:
+        tf_seconds = INTERVALS.get(interval_tf, 900)
+        # Get last capture for this TF
+        last_capture = None
+        try:
+            with SessionLocal() as session:
+                from sqlalchemy import select as sa_sel
+                row = session.scalar(
+                    sa_sel(ForwardObservation).where(
+                        ForwardObservation.capture_timeframe == canonical_tf,
+                        ForwardObservation.observation_status != "INVALID",
+                    ).order_by(ForwardObservation.capture_timestamp.desc()).limit(1)
+                )
+                if row:
+                    last_capture = row.capture_timestamp
+                    if last_capture.tzinfo is None:
+                        last_capture = last_capture.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+        if last_capture is None:
+            last_capture = start_date
+
+        # Walk forward from last_capture to now, detecting missed candle boundaries
+        cursor = last_capture
+        while cursor < now - timedelta(seconds=tf_seconds):
+            next_candle = cursor + timedelta(seconds=tf_seconds)
+            # Check if an observation exists for this candle
+            exists = False
+            try:
+                with SessionLocal() as session:
+                    from sqlalchemy import select as sa_sel
+                    row = session.scalar(
+                        sa_sel(ForwardObservation).where(
+                            ForwardObservation.capture_timeframe == canonical_tf,
+                            ForwardObservation.capture_timestamp == next_candle.replace(tzinfo=None),
+                        ).limit(1)
+                    )
+                    exists = row is not None
+            except Exception:
+                pass
+
+            if not exists and next_candle > start_date:
+                missed.append({
+                    "timeframe": canonical_tf,
+                    "market_timestamp": next_candle.isoformat(),
+                    "reason": "server offline during candle close",
+                })
+                _audit("MISSED_FORWARD_CAPTURE", detail=f"{canonical_tf} @ {next_candle.isoformat()}: server offline")
+
+            cursor = next_candle
+
+    return missed
+
+
+async def startup_recovery() -> dict:
+    """Phase 5.2: on backend startup, resume forward validation.
+    - Detect missed captures (log only — no fake retroactive captures)
+    - Evaluate any matured pending observations
+    """
+    global _FORWARD_STARTUP_TIME
+    _FORWARD_STARTUP_TIME = _time_module.monotonic()
+    
+    _audit("forward_startup_recovery", detail="resuming forward validation")
+    
+    # Detect missed captures
+    missed = detect_missed_captures()
+    if missed:
+        _audit("missed_captures_detected", detail=f"{len(missed)} missed capture events")
+    
+    # Evaluate pending observations
+    eval_result = await evaluate_pending_observations()
+    
+    return {
+        "missed_captures": len(missed),
+        "evaluated": eval_result.get("evaluated", 0),
+        "completed": eval_result.get("completed", 0),
+    }

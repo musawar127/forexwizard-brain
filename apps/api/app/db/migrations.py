@@ -345,3 +345,18 @@ def run_startup_migrations() -> None:
                     log.info("migration: added %s column to forward_outcomes", col_name)
     except Exception as exc:
         log.warning("migration: forward_outcomes Phase 5.1 column check failed: %s", exc)
+
+    # 12. Phase 5.2: canonicalize capture_timeframe values to M15/H1.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE forward_observations SET capture_timeframe='M15' "
+                "WHERE capture_timeframe='15min'"
+            ))
+            conn.execute(text(
+                "UPDATE forward_observations SET capture_timeframe='H1' "
+                "WHERE capture_timeframe='1h'"
+            ))
+            log.info("migration: canonicalized capture_timeframe values to M15/H1")
+    except Exception as exc:
+        log.warning("migration: capture_timeframe canonicalization failed: %s", exc)

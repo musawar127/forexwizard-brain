@@ -621,3 +621,22 @@ class SystemConfig(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ForwardHeartbeat(Base):
+    """Phase 5.2: lightweight periodic heartbeat from the forward collector."""
+
+    __tablename__ = "forward_heartbeats"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    collector_running: Mapped[bool] = mapped_column(Boolean, default=False)
+    evaluator_running: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_valid_quote_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_valid_quote_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_m15_capture_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_h1_capture_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_evaluation_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_observations: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    uptime_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)

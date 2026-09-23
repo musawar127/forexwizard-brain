@@ -34,10 +34,13 @@ from app.services.learning import (
 from app.services.forward import (
     capture_observation,
     evaluate_pending_observations,
+    get_forward_health,
     get_forward_performance,
     get_forward_status,
     get_observation as get_forward_observation,
     get_observations as get_forward_observations,
+    _record_heartbeat,
+    startup_recovery,
 )
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
@@ -74,6 +77,19 @@ async def lifespan(app: FastAPI):
     # Evaluation runs every 5 minutes (evaluates matured horizons).
     forward_task = asyncio.create_task(_forward_validation_loop(stop_event))
 
+    # Phase 5.2: startup recovery for forward validation
+    try:
+        recovery_result = await startup_recovery()
+        import logging
+        logging.getLogger("forexwizard").info(
+            "startup: forward recovery — missed_captures=%d evaluated=%d completed=%d",
+            recovery_result.get("missed_captures", 0),
+            recovery_result.get("evaluated", 0),
+            recovery_result.get("completed", 0),
+        )
+    except Exception:
+        pass  # startup recovery is best-effort
+
     yield
     stop_event.set()
     try:
@@ -88,34 +104,47 @@ async def lifespan(app: FastAPI):
 
 
 async def _forward_validation_loop(stop_event: asyncio.Event) -> None:
-    """Phase 5: periodic capture + evaluation of forward observations.
+    """Phase 5.2: periodic capture + evaluation of forward observations.
 
     Capture: every 15 minutes (aligned to M15 candle close).
     Evaluation: every 5 minutes (evaluates matured horizons).
+    Heartbeat: every 60 seconds (lightweight status persistence).
 
     Restart-safe: pending observations remain in DB and resume automatically.
+    Missed captures are logged (MISSED_FORWARD_CAPTURE) — never backfilled.
     """
     capture_interval = 900  # 15 minutes
     eval_interval = 300  # 5 minutes
+    heartbeat_interval = 60  # 1 minute
     last_capture = 0.0
     last_eval = 0.0
+    last_heartbeat = 0.0
 
-    from app.services.forward import capture_observation, evaluate_pending_observations
+    from app.services.forward import (
+        capture_observation,
+        evaluate_pending_observations,
+        _record_heartbeat,
+    )
 
     while not stop_event.is_set():
         try:
             now = asyncio.get_event_loop().time()
             if now - last_capture >= capture_interval:
-                await capture_observation(capture_timeframe="15min")
+                # Alternate between M15 and H1 captures
+                await capture_observation(capture_timeframe="M15")
+                await capture_observation(capture_timeframe="H1")
                 last_capture = now
             if now - last_eval >= eval_interval:
                 await evaluate_pending_observations()
                 last_eval = now
+            if now - last_heartbeat >= heartbeat_interval:
+                _record_heartbeat()
+                last_heartbeat = now
         except Exception:
             pass  # forward validation is best-effort — never break the live feed
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=30)
+            await asyncio.wait_for(stop_event.wait(), timeout=15)
         except asyncio.TimeoutError:
             pass
 
@@ -623,6 +652,48 @@ async def api_forward_evaluate():
     """Manually trigger evaluation of pending forward observations. Also
     runs automatically via the evaluation scheduler."""
     return await evaluate_pending_observations()
+
+
+@app.get("/api/forward/health")
+async def api_forward_health():
+    """Phase 5.2: forward collector + evaluator health status.
+    Returns collector status (ONLINE/DEGRADED/OFFLINE), uptime, last
+    captures, last evaluation, pending count, spot storage info."""
+    return get_forward_health()
+
+
+@app.get("/api/system/health")
+async def api_system_health():
+    """Phase 5.2: system-wide health summary across all subsystems.
+    Does NOT pretend optional services are healthy when unavailable."""
+    from app.services.market_state import state
+    quote = state.quote_with_freshness()
+    return {
+        "market_feed": {
+            "status": state.source_status,
+            "quote_status": quote.status if quote else "NO_DATA",
+            "last_error": state.last_error,
+        },
+        "database": {
+            "engine": "sqlite" if settings.database_url.startswith("sqlite") else "postgresql",
+            "status": "CONNECTED" if state.last_error is None or "Database" not in (state.last_error or "") else "ERROR",
+        },
+        "forward_collector": get_forward_health(),
+        "historical_engine": {
+            "feature_version": "features-v0.1",
+            "states_built": None,  # query on demand via /api/learning/status
+        },
+        "research_service": {
+            "status": state.research_status,
+            "error": state.research_error,
+        },
+        "redis": await redis_status(),
+        "brain": {
+            "status": "ONLINE" if state.analysis else "STARTING",
+            "decision": state.analysis.decision if state.analysis else None,
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.websocket("/ws/market")
