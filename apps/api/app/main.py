@@ -6,14 +6,21 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app.core.config import settings
 from app.db.base import Base
+from app.db.migrations import run_startup_migrations
 from app.db.session import engine
 from app.engine.candles import INTERVALS, candle_counts, get_candles
 from app.engine.predictions import performance_summary, recent_predictions
 from app.models.market import AskRequest, AskResponse
 from app.services.brain_chat import answer_question
+from app.services.historical import (
+    data_quality_summary,
+    sync_historical_candles,
+    timeframe_breakdown,
+)
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
 from app.services.research import recent_research
@@ -21,10 +28,12 @@ from app.services.research import recent_research
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Phase 3: run idempotent startup migrations (new tables + new columns)
+    # before the live market-data collector starts so the schema is consistent.
     try:
-        Base.metadata.create_all(engine)
+        run_startup_migrations()
     except Exception as exc:
-        state.last_error = f"Database initialization failed: {exc}"
+        state.last_error = f"Database migration failed: {exc}"
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(collector_loop(stop_event))
@@ -39,8 +48,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.2.0",
-    description="No-broker-login XAU/USD market intelligence starter with persistent local memory.",
+    version="0.3.0",
+    description="No-broker-login XAU/USD market intelligence starter with persistent local memory and Phase 3 historical market-memory layer.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -153,9 +162,100 @@ async def system_status():
         "research": state.research_status,
         "database": "CONNECTED" if state.last_error is None or "Database" not in state.last_error else "ERROR",
         "redis": await redis_status(),
-        "version": "0.2.0",
+        "version": "0.3.0",
         "brain_version": state.analysis.brain_version if state.analysis else "rules-v0.1",
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Historical market-memory endpoints
+#
+# These endpoints expose the genuine historical OHLC backfill layer that
+# runs over the HistoricalMarketDataProvider abstraction (Yahoo Finance as
+# default, Twelve Data when a key is supplied). The Brain BUY/SELL/WAIT
+# engine is NOT modified to consume these statistics yet — Phase 3 only
+# builds the clean historical market-memory layer.
+# ---------------------------------------------------------------------------
+
+class DataSyncRequest(BaseModel):
+    """POST /api/data/sync body.
+
+    The body is intentionally restrictive: callers cannot pick an
+    arbitrary symbol or arbitrary time range. The server-side
+    `historical_symbol` config (default "XAU/USD") is the only symbol
+    allowed. Timeframes default to the canonical set; callers may
+    restrict to a subset but cannot extend beyond it.
+    """
+
+    symbol: str | None = None
+    timeframes: list[str] | None = None
+
+
+@app.get("/api/data/status")
+async def data_status():
+    """Top-level historical data quality summary.
+
+    Returns: active provider + health, overall earliest/latest historical
+    timestamps, total historical candle count, per-interval breakdown
+    (candle_count, first/last timestamp, missing_intervals,
+    duplicate_count, integrity_status), and all HistoricalSyncState rows.
+    """
+    return await data_quality_summary(settings.historical_symbol)
+
+
+@app.get("/api/data/timeframes")
+async def data_timeframes():
+    """Per-interval breakdown of historical candles stored in the DB."""
+    return {
+        "intervals": timeframe_breakdown(settings.historical_symbol),
+        "supported_intervals": list(INTERVALS.keys()),
+    }
+
+
+@app.get("/api/data/gaps")
+async def data_gaps(interval: str = Query("1day")):
+    """Gap report for a single interval. Returns missing-period list +
+    completeness_pct based on the actually-persisted historical candles."""
+    if interval not in INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
+    from app.services.historical.validator import find_gaps
+    candles = await get_candles(interval, 5000, settings.historical_symbol)
+    historical_only = [c for c in candles if "aggregated" in c.provider or c.provider.startswith(("Yahoo", "Twelve"))]
+    report = find_gaps(historical_only, interval)
+    return {
+        "interval": interval,
+        "interval_seconds": report.interval_seconds,
+        "first_timestamp": report.first_timestamp.isoformat() if report.first_timestamp else None,
+        "last_timestamp": report.last_timestamp.isoformat() if report.last_timestamp else None,
+        "actual_count": report.actual_count,
+        "expected_periods": report.expected_periods,
+        "missing_periods": report.missing_periods,
+        "gaps": [t.isoformat() for t in report.gaps[:200]],  # cap payload size
+        "completeness_pct": report.completeness_pct,
+    }
+
+
+@app.post("/api/data/sync")
+async def data_sync(payload: DataSyncRequest | None = None):
+    """Trigger a single-shot historical backfill.
+
+    Safe to call repeatedly — already-present candles are skipped (dedup
+    on symbol+interval+timestamp). The body is optional; without it, the
+    server uses the canonical timeframe set M1, M5, M15, M30, H1, H4, D1.
+
+    No arbitrary uncontrolled downloads: the symbol is pinned to
+    `settings.historical_symbol` (default "XAU/USD"). Callers cannot
+    override the symbol.
+    """
+    if not settings.historical_sync_enabled:
+        raise HTTPException(status_code=403, detail="Historical sync disabled in backend config.")
+    symbol = settings.historical_symbol  # ignore payload.symbol — never trust client
+    tfs = payload.timeframes if (payload and payload.timeframes) else None
+    if tfs:
+        # Restrict to the canonical set; ignore anything else.
+        tfs = [t for t in tfs if t in INTERVALS]
+    summary = await sync_historical_candles(symbol=symbol, timeframes=tfs)
+    return summary
 
 
 @app.websocket("/ws/market")

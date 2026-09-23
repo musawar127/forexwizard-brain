@@ -38,6 +38,74 @@ class CandleRecord(Base):
     sample_count: Mapped[int] = mapped_column(Integer, default=1)
     provider: Mapped[str] = mapped_column(String(64), default="Local sampled Gold API")
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Phase 3: distinguishes locally-sampled candles from genuine historical
+    # OHLC candles fetched from an external provider. Defaults to False for
+    # backward compatibility with rows created before Phase 3.
+    is_historical: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class HistoricalSyncState(Base):
+    """Phase 3: per-(provider, symbol, interval) synchronization state.
+
+    Records the last successful backfill, the earliest/latest candle
+    timestamps the provider returned, the total candle count, and the
+    last error (if any). Drives the /api/data/* endpoints.
+    """
+
+    __tablename__ = "historical_sync_state"
+    __table_args__ = (
+        UniqueConstraint("provider", "symbol", "interval", name="uq_historical_sync_p_s_i"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    interval: Mapped[str] = mapped_column(String(16), index=True)
+    earliest_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    latest_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    total_candles: Mapped[int] = mapped_column(Integer, default=0)
+    sync_status: Mapped[str] = mapped_column(String(32), default="never_synced")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class HistoricalFeatureSnapshot(Base):
+    """Phase 3: deterministic market-feature snapshot for a historical candle.
+
+    Stores the Brain feature vector (EMA/RSI/ATR/regime/trend/swing/S-R/
+    volatility/session/alignment) computed at a specific historical timestamp
+    so future predictions can be evaluated against stored state.
+
+    No strategy optimization is performed on these snapshots — they are
+    read-only historical context, used for measurement rather than tuning.
+    """
+
+    __tablename__ = "historical_feature_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "interval", "timestamp", name="uq_historical_feature_s_i_t"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    interval: Mapped[str] = mapped_column(String(16), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ema_fast: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ema_slow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rsi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trend: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    regime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    swing_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    swing_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    support_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    support_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resistance_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resistance_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volatility: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timeframe_alignment: Mapped[float | None] = mapped_column(Float, nullable=True)
+    features_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class PredictionRecord(Base):

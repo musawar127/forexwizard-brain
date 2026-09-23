@@ -41,3 +41,8 @@ upload/
 Thumbs.db
 .vscode/
 .idea/
+
+# Test databases (created by pytest)
+apps/api/forexwizard_test.db
+apps/api/forexwizard_test.db-shm
+apps/api/forexwizard_test.db-wal

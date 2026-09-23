@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     analysis_min_candles: int = 14
     prediction_interval_seconds: int = 60
 
+    # Phase 3: historical market-memory layer.
+    # Yahoo Finance (GC=F gold futures) needs no key and is the default
+    # fallback. Twelve Data (XAU/USD spot) takes priority when a key is set.
+    # Stooq / Alpha Vantage can be added later by registering new providers.
+    historical_symbol: str = "XAU/USD"
+    historical_sync_enabled: bool = True
+    historical_sync_max_retries: int = 3
+    historical_features_enabled: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
