@@ -2,13 +2,50 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import select
+
 from app.core.config import settings
+from app.db.models import HistoricalSyncState
+from app.db.session import SessionLocal
 from app.engine.candles import get_candles
 from app.engine.indicators import atr, ema, rsi, slope
 from app.models.market import BrainAnalysis, Candle, TimeframeState, Zone
 
 
 TIMEFRAMES = ["4h", "1h", "30min", "15min", "5min", "1min"]
+
+
+def _full_historical_depth_days(symbol: str, interval: str) -> float:
+    """Query HistoricalSyncState for the FULL earliest/latest historical
+    range at this TF — not just the 120 most recent candles the Brain
+    reads for its trend analysis. This gives an honest depth number that
+    reflects the genuine history available in the DB."""
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(HistoricalSyncState).where(
+                HistoricalSyncState.symbol == symbol,
+                HistoricalSyncState.interval == interval,
+            )
+        ).all()
+        if not rows:
+            return 0.0
+        earliest = None
+        latest = None
+        for r in rows:
+            if r.earliest_timestamp:
+                if earliest is None or r.earliest_timestamp < earliest:
+                    earliest = r.earliest_timestamp
+            if r.latest_timestamp:
+                if latest is None or r.latest_timestamp > latest:
+                    latest = r.latest_timestamp
+        if not earliest or not latest:
+            return 0.0
+        # Treat naive datetimes as UTC.
+        if earliest.tzinfo is None:
+            earliest = earliest.replace(tzinfo=timezone.utc)
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        return round((latest - earliest).total_seconds() / 86400.0, 2)
 
 
 def _trend(candles: list[Candle]) -> tuple[str, float | None, float | None, float | None, float | None]:
@@ -52,10 +89,44 @@ def _zones(candles: list[Candle], price: float) -> tuple[Zone | None, Zone | Non
     return support, resistance
 
 
+def _historical_depth_days(candles: list[Candle]) -> float:
+    """Days of genuine historical depth at this TF — counts ONLY candles
+    with is_historical=True so sampled live history doesn't masquerade
+    as multi-day historical depth."""
+    hist = [c for c in candles if getattr(c, "is_historical", False)]
+    if not hist:
+        return 0.0
+    span = (max(c.timestamp for c in hist) - min(c.timestamp for c in hist)).total_seconds()
+    return round(span / 86400.0, 2)
+
+
+def _instrument_consistency(candles: list[Candle]) -> str:
+    """PURE_GC / PURE_SPOT / MIXED / NONE for a candle list."""
+    if not candles:
+        return "NONE"
+    instruments = {getattr(c, "instrument", None) for c in candles}
+    instruments.discard(None)
+    if not instruments:
+        return "NONE"
+    if len(instruments) > 1:
+        return "MIXED"
+    only = next(iter(instruments))
+    if only == "GC_FRONT_MONTH":
+        return "PURE_GC"
+    if only == "XAUUSD_SPOT":
+        return "PURE_SPOT"
+    return f"PURE_{only}"
+
+
 async def analyze_market(price: float | None, quote_status: str, source_status: str) -> BrainAnalysis:
     now = datetime.now(timezone.utc)
     timeframe_states: list[TimeframeState] = []
     by_tf: dict[str, tuple[list[Candle], TimeframeState]] = {}
+
+    # Phase 3.1: track per-TF historical depth + instrument consistency
+    # so the Brain can report them WITHOUT feeding them into the score.
+    historical_depth: dict[str, float] = {}
+    instrument_per_tf: dict[str, set[str]] = {}
 
     for tf in TIMEFRAMES:
         candles = await get_candles(tf, 120)
@@ -73,9 +144,31 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         )
         timeframe_states.append(state)
         by_tf[tf] = (candles, state)
+        # Phase 3.1: historical_depth reports the FULL DB range from
+        # HistoricalSyncState, not just the 120 most recent candles. This
+        # is honest about what genuine history is available even if the
+        # Brain's trend analysis only uses the recent 120.
+        historical_depth[tf] = _full_historical_depth_days("XAU/USD", tf)
+        instrument_per_tf[tf] = {getattr(c, "instrument", "XAUUSD_SPOT") for c in candles}
 
     ready = [x for x in timeframe_states if x.status == "READY" and x.trend != "INSUFFICIENT_DATA"]
     readiness = min(100.0, round(len(ready) / 4 * 100, 1))
+
+    # Phase 3.1: instrument consistency across ALL TFs combined.
+    all_instruments: set[str] = set()
+    for s in instrument_per_tf.values():
+        all_instruments |= s
+    all_instruments.discard(None)
+    if not all_instruments:
+        instrument_consistency = "NONE"
+    elif len(all_instruments) > 1:
+        instrument_consistency = "MIXED"
+    elif "GC_FRONT_MONTH" in all_instruments:
+        instrument_consistency = "PURE_GC"
+    elif "XAUUSD_SPOT" in all_instruments:
+        instrument_consistency = "PURE_SPOT"
+    else:
+        instrument_consistency = f"PURE_{next(iter(all_instruments))}"
 
     if price is None or quote_status == "STALE" or source_status != "CONNECTED":
         return BrainAnalysis(
@@ -92,6 +185,9 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
             timeframes=timeframe_states,
             data_quality="BAD",
             message="Analysis paused because current market data is not reliable enough.",
+            historical_depth=historical_depth,
+            instrument_consistency=instrument_consistency,
+            technical_data_readiness=readiness,
         )
 
     # Select the richest locally accumulated timeframe for nearby zones.
@@ -102,6 +198,7 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
             break
     support, resistance = _zones(zone_candles, price)
 
+    # ---- BUY/SELL/WAIT SCORING LOGIC — UNCHANGED FROM rules-v0.1 ----
     score = 0.0
     reasons: list[str] = []
     against: list[str] = []
@@ -153,6 +250,7 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         else:
             decision = "WAIT"
             against.append("Evidence does not meet the conservative BUY/SELL threshold.")
+    # ---- END UNCHANGED SCORING LOGIC ----
 
     if bullish >= 3 and bearish == 0:
         regime = "TREND_UP"
@@ -197,4 +295,7 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         timeframes=timeframe_states,
         data_quality=data_quality,
         message=message,
+        historical_depth=historical_depth,
+        instrument_consistency=instrument_consistency,
+        technical_data_readiness=readiness,
     )

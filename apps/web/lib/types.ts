@@ -46,6 +46,12 @@ export type BrainAnalysis = {
   data_quality: string;
   message: string;
   brain_version: string;
+  // Phase 3.1: distinguish technical readiness from historical depth +
+  // instrument consistency. These do NOT influence the BUY/SELL/WAIT
+  // decision — only clarify what the confidence number is backed by.
+  historical_depth?: Record<string, number>;
+  instrument_consistency?: string;
+  technical_data_readiness?: number;
 };
 
 export type Snapshot = {
@@ -84,7 +90,7 @@ export type ResearchItem = {
 };
 
 // ---------------------------------------------------------------------------
-// Phase 3: Historical market-memory types
+// Phase 3 + 3.1: Historical market-memory types
 // ---------------------------------------------------------------------------
 
 export type ProviderHealthInfo = {
@@ -96,17 +102,32 @@ export type ProviderHealthInfo = {
   extra: Record<string, unknown> | null;
 };
 
-export type IntervalStat = {
+/** Phase 3.1: per-(interval, instrument, derivation) row — one entry per
+ * lineage group. The /data page renders one row per group so DIRECT and
+ * AGGREGATED candles at the same TF appear as separate rows. */
+export type IntervalLineageRow = {
   interval: string;
-  providers: string[];
+  provider: string;
+  derivation: string;        // "DIRECT" | "AGGREGATED" | "SAMPLED"
+  instrument: string;        // "GC_FRONT_MONTH" | "XAUUSD_SPOT"
+  provider_symbol: string;  // "GC=F" | "XAU"
+  source_timeframe: string;
+  target_timeframe: string;
   candle_count: number;
   first_timestamp: string | null;
   last_timestamp: string | null;
-  missing_intervals?: number;
-  expected_periods?: number;
-  completeness_pct?: number;
-  duplicate_count?: number;
-  integrity_status?: string;
+  days_covered: number | null;
+};
+
+export type IntervalQuality = {
+  interval: string;
+  missing_intervals: number;
+  expected_periods: number;
+  completeness_pct: number;
+  duplicate_count: number;
+  integrity_status: string;
+  instrument_consistency: string;  // PURE_GC | PURE_SPOT | MIXED | NONE
+  historical_depth_days: number;
 };
 
 export type SyncStateRow = {
@@ -118,6 +139,11 @@ export type SyncStateRow = {
   total_candles: number;
   sync_status: string;
   last_error: string | null;
+  instrument: string;
+  provider_symbol: string;
+  derivation: string;
+  source_timeframe: string;
+  target_timeframe: string;
 };
 
 export type DataQualitySummary = {
@@ -129,7 +155,8 @@ export type DataQualitySummary = {
     latest_timestamp: string | null;
     total_candles: number;
   };
-  by_interval: IntervalStat[];
+  by_interval: Record<string, IntervalLineageRow[]>;  // Phase 3.1: dict keyed by interval
+  interval_quality: Record<string, IntervalQuality>;  // Phase 3.1: per-interval quality
   sync_states: SyncStateRow[];
   database_health: {
     total_candle_rows: number;
@@ -142,9 +169,16 @@ export type DataQualitySummary = {
 
 export type TimeframeRow = {
   interval: string;
+  provider: string;
+  derivation: string;
+  instrument: string;
+  provider_symbol: string;
+  source_timeframe: string;
+  target_timeframe: string;
   candle_count: number;
   first_timestamp: string | null;
   last_timestamp: string | null;
+  days_covered: number | null;
   duplicate_count: number;
   integrity_status: string;
 };
@@ -174,6 +208,11 @@ export type SyncTimeframeResult = {
   last_timestamp: string | null;
   sync_status: string;
   last_error: string | null;
+  instrument: string | null;
+  provider_symbol: string | null;
+  derivation: string;
+  source_timeframe: string | null;
+  target_timeframe: string;
 };
 
 export type SyncSummary = {
@@ -183,4 +222,13 @@ export type SyncSummary = {
   completed_at?: string;
   timeframes: Record<string, SyncTimeframeResult>;
   notes: string[];
+};
+
+/** Phase 3.1: BrainAnalysis now carries historical_depth per TF +
+ * instrument_consistency + technical_data_readiness (separate from
+ * the legacy "readiness" field which is kept for backward compat). */
+export type BrainAnalysisExtras = {
+  historical_depth: Record<string, number>;
+  instrument_consistency: string;  // PURE_GC | PURE_SPOT | MIXED | NONE
+  technical_data_readiness: number;
 };

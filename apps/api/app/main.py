@@ -220,7 +220,10 @@ async def data_gaps(interval: str = Query("1day")):
         raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
     from app.services.historical.validator import find_gaps
     candles = await get_candles(interval, 5000, settings.historical_symbol)
-    historical_only = [c for c in candles if "aggregated" in c.provider or c.provider.startswith(("Yahoo", "Twelve"))]
+    # Phase 3.1: filter by is_historical flag rather than by provider-string
+    # matching, so mixed-instrument batches (GC_FRONT_MONTH + XAUUSD_SPOT)
+    # are correctly included in the gap analysis.
+    historical_only = [c for c in candles if getattr(c, "is_historical", False)]
     report = find_gaps(historical_only, interval)
     return {
         "interval": interval,
@@ -232,6 +235,44 @@ async def data_gaps(interval: str = Query("1day")):
         "missing_periods": report.missing_periods,
         "gaps": [t.isoformat() for t in report.gaps[:200]],  # cap payload size
         "completeness_pct": report.completeness_pct,
+    }
+
+
+@app.get("/api/data/basis")
+async def data_basis(limit: int = Query(100, ge=1, le=1000)):
+    """Phase 3.1: research-only futures-vs-spot basis history.
+
+    Returns the most recent BasisObservation rows (futures_price,
+    spot_price, basis = futures - spot). When both a recent GC=F futures
+    price (Yahoo) and a recent XAU/USD spot price (Gold API) exist
+    within a small time window, the system stores a basis row.
+
+    This endpoint is research-only — it does NOT feed into the Brain
+    BUY/SELL/WAIT logic. Phase 4 may consume it for statistical learning.
+    """
+    from app.db.models import BasisObservation
+    from app.db.session import SessionLocal
+    from sqlalchemy import select
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(BasisObservation).order_by(BasisObservation.timestamp.desc()).limit(limit)
+        ).all()
+    return {
+        "count": len(rows),
+        "rows": [
+            {
+                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "futures_price": r.futures_price,
+                "spot_price": r.spot_price,
+                "basis": r.basis,
+                "futures_provider": r.futures_provider,
+                "spot_provider": r.spot_provider,
+                "futures_symbol": r.futures_symbol,
+                "spot_symbol": r.spot_symbol,
+                "captured_at": r.captured_at.isoformat() if r.captured_at else None,
+            }
+            for r in rows
+        ],
     }
 
 

@@ -54,13 +54,24 @@ YAHOO_INTERVALS: dict[str, str | None] = {
 }
 
 # Mapping of ForexWizard canonical timeframes to Yahoo `range` defaults.
-# These match Yahoo's documented per-interval hard limits.
+# Yahoo's per-interval hard limits — EMPIRICALLY VERIFIED 2026-09-23:
+#   - 1m:      range up to 7d (we use 5d; 7d sometimes returns 422)
+#   - 5m:      range up to 1mo (NOT 3mo — Yahoo returns 422 for >1mo)
+#   - 15m:     range up to 1mo
+#   - 30m:     range up to 1mo
+#   - 60m/1h:  range up to 2y (730d observed in practice)
+#   - 1d:      range up to "max" (10+ years)
+#
+# Phase 3.1 design rule: use the deepest NATIVE interval Yahoo permits
+# rather than deriving short-window TFs from shallow M1 history.
+# M5/M15/M30/H1 are fetched DIRECTLY from Yahoo at their native depth;
+# only H4 is derived locally (from H1) because Yahoo has no native 4h.
 YAHOO_DEFAULT_RANGES: dict[str, str] = {
     "1min": "5d",
-    "5min": "3mo",
-    "15min": "3mo",
-    "30min": "3mo",
-    "1h": "2y",
+    "5min": "1mo",   # 30 days — Yahoo's actual max for 5m
+    "15min": "1mo",  # 30 days — Yahoo's actual max for 15m
+    "30min": "1mo",  # 30 days — Yahoo's actual max for 30m
+    "1h": "2y",      # 2 years — Yahoo's actual max for 1h
     "1day": "10y",
 }
 
@@ -161,7 +172,10 @@ class YahooFinanceHistoricalProvider(HistoricalMarketDataProvider):
         end: datetime | None = None,
     ) -> list[Candle]:
         # Yahoo only serves one symbol (GC=F) for this provider. `symbol`
-        # is still accepted so the ABC signature is uniform across providers.
+        # is still accepted so the ABC signature is uniform across providers,
+        # but each returned Candle records provider_symbol="GC=F" and
+        # instrument="GC_FRONT_MONTH" so historical statistical learning
+        # (Phase 4+) will know which instrument generated the observation.
         if timeframe == "4h":
             return []  # Yahoo has no native 4h; H4 is derived from 1h locally.
         url, params = self._build_url_and_params(timeframe, start, end)
@@ -205,6 +219,12 @@ class YahooFinanceHistoricalProvider(HistoricalMarketDataProvider):
                     volume=v if v is not None and v > 0 else None,
                     sample_count=1,
                     provider=self.provider_name,
+                    is_historical=True,
+                    derivation="DIRECT",           # native Yahoo interval
+                    provider_symbol=self._yahoo_symbol,  # "GC=F"
+                    instrument="GC_FRONT_MONTH",
+                    source_timeframe=timeframe,    # native TF = own interval
+                    target_timeframe=timeframe,
                 )
             )
         return candles

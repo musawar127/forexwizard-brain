@@ -65,6 +65,11 @@ def aggregate_candles(
 
     Returns:
         Sorted list of aggregated candles (may be empty).
+
+    Phase 3.1: each aggregated candle preserves full source lineage —
+    derivation="AGGREGATED", provider_symbol/instrument inherited from
+    the source candles, source_timeframe = the lower TF, target_timeframe
+    = the higher TF.
     """
     if not source_candles:
         return []
@@ -77,6 +82,13 @@ def aggregate_candles(
     if provider_label is None:
         src_provider = source_candles[0].provider
         provider_label = f"{src_provider} (aggregated to {target_interval})"
+
+    # Inherit instrument + provider_symbol from source candles so the
+    # aggregated output keeps full lineage. All source candles should
+    # have the same instrument (homogeneous) — if not, we still use the
+    # first one (the validator will catch mixed-instrument batches).
+    instrument = source_candles[0].instrument
+    provider_symbol = source_candles[0].provider_symbol
 
     target_seconds = INTERVALS[target_interval]
     buckets: dict[datetime, list[Candle]] = defaultdict(list)
@@ -104,6 +116,12 @@ def aggregate_candles(
                 volume=sum(volumes) if volumes else None,
                 sample_count=len(members),
                 provider=provider_label,
+                is_historical=True,
+                derivation="AGGREGATED",
+                provider_symbol=provider_symbol,
+                instrument=instrument,
+                source_timeframe=source_interval,
+                target_timeframe=target_interval,
             )
         )
     return out

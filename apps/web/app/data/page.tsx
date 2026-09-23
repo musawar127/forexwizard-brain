@@ -25,6 +25,32 @@ function prettyTf(tf: string): string {
   );
 }
 
+function fmtDays(days: number | null | undefined): string {
+  if (days == null) return "—";
+  if (days < 1) return `${(days * 24).toFixed(1)}h`;
+  if (days < 30) return `${days.toFixed(1)}d`;
+  if (days < 365) return `${(days / 30.44).toFixed(1)}mo`;
+  return `${(days / 365.25).toFixed(1)}y`;
+}
+
+const INSTRUMENT_LABEL: Record<string, string> = {
+  GC_FRONT_MONTH: "GC=F futures",
+  XAUUSD_SPOT: "XAU spot",
+};
+
+const CONSISTENCY_COLOR: Record<string, string> = {
+  PURE_GC: "var(--green)",
+  PURE_SPOT: "var(--blue)",
+  MIXED: "var(--amber)",
+  NONE: "var(--muted)",
+};
+
+const DERIVATION_COLOR: Record<string, string> = {
+  DIRECT: "var(--green)",
+  AGGREGATED: "var(--amber)",
+  SAMPLED: "var(--muted)",
+};
+
 export default function DataPage() {
   const [summary, setSummary] = useState<DataQualitySummary | null>(null);
   const [timeframes, setTimeframes] = useState<TimeframeRow[]>([]);
@@ -80,23 +106,19 @@ export default function DataPage() {
   const historical = summary?.historical;
   const providers = summary?.providers ?? [];
   const syncStates = summary?.sync_states ?? [];
-  const byInterval = summary?.by_interval ?? [];
+  const byInterval = summary?.by_interval ?? {};
+  const intervalQuality = summary?.interval_quality ?? {};
   const dbHealth = summary?.database_health;
 
-  // Build a unified per-interval view (status + timeframes merge).
-  const intervalRows = (timeframes.length ? timeframes : byInterval).map((row) => {
-    const detailed = byInterval.find((x) => x.interval === row.interval);
-    return {
-      interval: row.interval,
-      candle_count: row.candle_count ?? detailed?.candle_count ?? 0,
-      first_timestamp: row.first_timestamp ?? detailed?.first_timestamp ?? null,
-      last_timestamp: row.last_timestamp ?? detailed?.last_timestamp ?? null,
-      missing_intervals: detailed?.missing_intervals ?? 0,
-      expected_periods: detailed?.expected_periods ?? 0,
-      completeness_pct: detailed?.completeness_pct ?? 0,
-      duplicate_count: row.duplicate_count ?? detailed?.duplicate_count ?? 0,
-      integrity_status: row.integrity_status ?? detailed?.integrity_status ?? "OK",
-    };
+  // Phase 3.1: timeframe_breakdown returns one row per (interval, instrument,
+  // derivation) group — DIRECT and AGGREGATED candles at the same TF appear
+  // as separate rows. Sort by interval length, then derivation.
+  const sortedTimeframes = [...timeframes].sort((a, b) => {
+    const order = ["1min", "5min", "15min", "30min", "1h", "4h", "1day"];
+    const ia = order.indexOf(a.interval);
+    const ib = order.indexOf(b.interval);
+    if (ia !== ib) return ia - ib;
+    return (a.derivation || "").localeCompare(b.derivation || "");
   });
 
   return (
@@ -106,7 +128,7 @@ export default function DataPage() {
           <span>DATA QUALITY</span>
           <h2>Historical market memory</h2>
         </div>
-        <p>Genuine backfilled XAU/USD OHLC storage, validation, and sync state. No synthetic candles.</p>
+        <p>Genuine backfilled XAU/USD OHLC with full source lineage. No synthetic candles.</p>
       </div>
 
       {error && (
@@ -118,10 +140,10 @@ export default function DataPage() {
       <section className="hero-grid">
         <div className="panel big-number-panel">
           <span>Active provider</span>
-          <strong style={{ fontSize: "20px", letterSpacing: "-0.02em" }}>
+          <strong style={{ fontSize: "18px", letterSpacing: "-0.02em" }}>
             {summary?.active_provider || "—"}
           </strong>
-          <p>The current historical-data provider. Yahoo Finance (GC=F gold futures) is the default; Twelve Data takes priority when a key is set in backend .env.</p>
+          <p>Yahoo Finance (GC=F gold futures) is the default; Twelve Data takes priority when a key is set in backend .env.</p>
         </div>
         <div className="panel big-number-panel">
           <span>Total historical candles</span>
@@ -200,11 +222,11 @@ export default function DataPage() {
       <section className="panel" style={{ marginTop: "12px" }}>
         <div className="panel-head">
           <div>
-            <div className="panel-kicker">BY TIMEFRAME</div>
-            <h2>Candle integrity per interval</h2>
+            <div className="panel-kicker">BY TIMEFRAME + INSTRUMENT + DERIVATION</div>
+            <h2>Per-lineage candle integrity</h2>
           </div>
           <span className="mini-chip">
-            {intervalRows.reduce((acc, r) => acc + r.candle_count, 0)} total candles
+            {sortedTimeframes.reduce((acc, r) => acc + r.candle_count, 0)} candles · {sortedTimeframes.length} lineage groups
           </span>
         </div>
         <div className="table-wrap">
@@ -212,48 +234,60 @@ export default function DataPage() {
             <thead>
               <tr>
                 <th>TF</th>
+                <th>Instrument</th>
+                <th>Provider</th>
+                <th>Provider Symbol</th>
+                <th>Derivation</th>
+                <th>Source → Target</th>
                 <th>Candles</th>
                 <th>First</th>
                 <th>Last</th>
-                <th>Missing</th>
-                <th>Completeness</th>
+                <th>Days</th>
                 <th>Dup</th>
                 <th>Integrity</th>
               </tr>
             </thead>
             <tbody>
-              {intervalRows.map((row) => {
-                const tone =
-                  row.integrity_status === "OK" ? "ok" : row.integrity_status === "DEGRADED" ? "warn" : "flat";
-                return (
-                  <tr key={row.interval}>
-                    <td><strong>{prettyTf(row.interval)}</strong></td>
-                    <td>{row.candle_count}</td>
-                    <td>{fmtTs(row.first_timestamp)}</td>
-                    <td>{fmtTs(row.last_timestamp)}</td>
-                    <td>{row.missing_intervals}</td>
-                    <td>{row.completeness_pct ? `${row.completeness_pct}%` : "—"}</td>
-                    <td>{row.duplicate_count}</td>
-                    <td>
-                      <span
-                        style={{
-                          color: tone === "ok" ? "var(--green)" : tone === "warn" ? "var(--amber)" : "var(--muted)",
-                          background: tone === "ok" ? "rgba(46,211,154,.08)" : tone === "warn" ? "rgba(242,184,75,.08)" : "#1a222d",
-                          padding: "4px 7px",
-                          borderRadius: "999px",
-                          fontSize: "8px",
-                          fontWeight: 800,
-                        }}
-                      >
-                        {row.integrity_status}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-              {intervalRows.length === 0 && (
+              {sortedTimeframes.map((row, i) => (
+                <tr key={`${row.interval}-${row.derivation}-${row.instrument}-${i}`}>
+                  <td><strong>{prettyTf(row.interval)}</strong></td>
+                  <td>
+                    <span style={{ color: "var(--blue)", fontSize: "10px", fontWeight: 700 }}>
+                      {INSTRUMENT_LABEL[row.instrument] || row.instrument}
+                    </span>
+                  </td>
+                  <td style={{ fontSize: "9px", color: "var(--muted)" }}>{row.provider}</td>
+                  <td><code style={{ fontSize: "9px", color: "var(--gold)" }}>{row.provider_symbol}</code></td>
+                  <td>
+                    <span style={{ color: DERIVATION_COLOR[row.derivation] || "var(--muted)", fontWeight: 700, fontSize: "9px" }}>
+                      {row.derivation}
+                    </span>
+                  </td>
+                  <td style={{ fontSize: "9px" }}>
+                    <code>{prettyTf(row.source_timeframe)}</code> → <code>{prettyTf(row.target_timeframe)}</code>
+                  </td>
+                  <td>{row.candle_count}</td>
+                  <td>{fmtTs(row.first_timestamp)}</td>
+                  <td>{fmtTs(row.last_timestamp)}</td>
+                  <td><strong>{fmtDays(row.days_covered)}</strong></td>
+                  <td>{row.duplicate_count}</td>
+                  <td>
+                    <span style={{
+                      color: row.integrity_status === "OK" ? "var(--green)" : "var(--amber)",
+                      background: row.integrity_status === "OK" ? "rgba(46,211,154,.08)" : "rgba(242,184,75,.08)",
+                      padding: "4px 7px",
+                      borderRadius: "999px",
+                      fontSize: "8px",
+                      fontWeight: 800,
+                    }}>
+                      {row.integrity_status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+              {sortedTimeframes.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="empty-state">
+                  <td colSpan={12} className="empty-state">
                     No timeframes synced yet. Click “Trigger sync” to backfill genuine XAU/USD history.
                   </td>
                 </tr>
@@ -263,10 +297,73 @@ export default function DataPage() {
         </div>
       </section>
 
+      <section className="panel" style={{ marginTop: "12px" }}>
+        <div className="panel-head">
+          <div>
+            <div className="panel-kicker">INTERVAL QUALITY</div>
+            <h2>Historical depth + instrument consistency per TF</h2>
+          </div>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>TF</th>
+                <th>Historical Depth</th>
+                <th>Instrument Consistency</th>
+                <th>Missing</th>
+                <th>Expected</th>
+                <th>Completeness</th>
+                <th>Dup</th>
+                <th>Integrity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(intervalQuality).map(([tf, q]) => (
+                <tr key={tf}>
+                  <td><strong>{prettyTf(tf)}</strong></td>
+                  <td><strong style={{ color: "var(--gold)" }}>{fmtDays(q.historical_depth_days)}</strong></td>
+                  <td>
+                    <span style={{
+                      color: CONSISTENCY_COLOR[q.instrument_consistency] || "var(--muted)",
+                      fontWeight: 700,
+                      fontSize: "10px",
+                    }}>
+                      {q.instrument_consistency}
+                    </span>
+                  </td>
+                  <td>{q.missing_intervals}</td>
+                  <td>{q.expected_periods}</td>
+                  <td>{q.completeness_pct ? `${q.completeness_pct}%` : "—"}</td>
+                  <td>{q.duplicate_count}</td>
+                  <td>
+                    <span style={{
+                      color: q.integrity_status === "OK" ? "var(--green)" : "var(--amber)",
+                      background: q.integrity_status === "OK" ? "rgba(46,211,154,.08)" : "rgba(242,184,75,.08)",
+                      padding: "4px 7px",
+                      borderRadius: "999px",
+                      fontSize: "8px",
+                      fontWeight: 800,
+                    }}>
+                      {q.integrity_status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted" style={{ fontSize: "9px", marginTop: "8px", lineHeight: 1.5 }}>
+          Missing intervals are real market closures (weekends/holidays) — detected but NOT silently repaired.
+          Historical depth is the full DB range from HistoricalSyncState, not just the 120 most recent candles the Brain reads.
+          Instrument consistency MIXED means both GC_FRONT_MONTH (Yahoo futures) and XAUUSD_SPOT (Gold API spot) candles exist at this TF — never merged.
+        </p>
+      </section>
+
       <section className="two-col" style={{ marginTop: "12px" }}>
         <div className="panel">
           <div className="panel-kicker">SYNC STATE</div>
-          <h2>Per-interval sync log</h2>
+          <h2>Per-lineage sync log</h2>
           <div className="list-stack">
             {syncStates.length === 0 && (
               <div className="empty-state">No sync runs recorded yet.</div>
@@ -275,7 +372,11 @@ export default function DataPage() {
               <div className="list-item" key={`${s.provider}-${s.interval}-${i}`}>
                 <strong>{prettyTf(s.interval)} · {s.provider}</strong>
                 <div style={{ fontSize: "9px", color: "var(--muted)", marginTop: "4px" }}>
-                  status: <b>{s.sync_status}</b> · candles: <b>{s.total_candles}</b>
+                  status: <b>{s.sync_status}</b> · candles: <b>{s.total_candles}</b> · derivation: <b style={{ color: DERIVATION_COLOR[s.derivation] || "var(--muted)" }}>{s.derivation}</b>
+                  <br />
+                  instrument: <code style={{ color: "var(--blue)" }}>{s.instrument}</code> · provider_symbol: <code style={{ color: "var(--gold)" }}>{s.provider_symbol}</code>
+                  <br />
+                  source_timeframe: <code>{prettyTf(s.source_timeframe)}</code> → target_timeframe: <code>{prettyTf(s.target_timeframe)}</code>
                   <br />
                   last sync: {fmtTs(s.last_sync_at)}
                   <br />
@@ -327,12 +428,15 @@ export default function DataPage() {
               <thead>
                 <tr>
                   <th>TF</th>
+                  <th>Instrument</th>
+                  <th>Derivation</th>
+                  <th>Source → Target</th>
                   <th>Fetched</th>
                   <th>Inserted</th>
                   <th>Skipped</th>
                   <th>Dup in batch</th>
                   <th>Invalid OHLC</th>
-                  <th>Out of order</th>
+                  <th>OOO</th>
                   <th>Gaps</th>
                   <th>Status</th>
                 </tr>
@@ -341,6 +445,19 @@ export default function DataPage() {
                 {Object.entries(syncResult.timeframes).map(([tf, r]) => (
                   <tr key={tf}>
                     <td><strong>{prettyTf(tf)}</strong></td>
+                    <td>
+                      <span style={{ color: "var(--blue)", fontSize: "9px" }}>
+                        {INSTRUMENT_LABEL[r.instrument || ""] || r.instrument || "—"}
+                      </span>
+                    </td>
+                    <td>
+                      <span style={{ color: DERIVATION_COLOR[r.derivation] || "var(--muted)", fontWeight: 700, fontSize: "9px" }}>
+                        {r.derivation}
+                      </span>
+                    </td>
+                    <td style={{ fontSize: "9px" }}>
+                      <code>{prettyTf(r.source_timeframe || "")}</code> → <code>{prettyTf(r.target_timeframe)}</code>
+                    </td>
                     <td>{r.candles_fetched}</td>
                     <td>{r.inserted}</td>
                     <td>{r.skipped_already_present}</td>

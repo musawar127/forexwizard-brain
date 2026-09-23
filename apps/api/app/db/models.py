@@ -42,6 +42,48 @@ class CandleRecord(Base):
     # OHLC candles fetched from an external provider. Defaults to False for
     # backward compatibility with rows created before Phase 3.
     is_historical: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # Phase 3.1: source lineage. Each candle is now tagged with:
+    #   - derivation:      DIRECT (provider gave OHLC at this TF natively),
+    #                       AGGREGATED (we built OHLC from a lower-TF candle),
+    #                       or SAMPLED (built from raw spot ticks, live feed).
+    #   - provider_symbol: the upstream symbol (e.g. "GC=F" for Yahoo gold
+    #                       futures, "XAU" for Gold API spot).
+    #   - instrument:      canonical bucket — "GC_FRONT_MONTH" for Yahoo
+    #                       futures, "XAUUSD_SPOT" for Gold API spot.
+    #   - source_timeframe: the TF the candle was sourced from (for DIRECT
+    #                       this equals the candle's own interval; for
+    #                       AGGREGATED it is the lower TF; for SAMPLED it
+    #                       is "TICK").
+    #   - target_timeframe: the candle's own interval.
+    derivation: Mapped[str] = mapped_column(String(16), default="SAMPLED", index=True)
+    provider_symbol: Mapped[str] = mapped_column(String(32), default="XAU")
+    instrument: Mapped[str] = mapped_column(String(32), default="XAUUSD_SPOT", index=True)
+    source_timeframe: Mapped[str] = mapped_column(String(16), default="TICK")
+    target_timeframe: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class BasisObservation(Base):
+    """Phase 3.1: optional futures-vs-spot basis research record.
+
+    When both a recent GC=F futures price (Yahoo) and a recent XAU/USD
+    spot price (Gold API) exist within a small time window, we compute
+    basis = futures_price - spot_price and store it for future research.
+    This NEVER feeds into BUY/SELL/WAIT logic — Phase 4 may use it for
+    statistical learning; Phase 3.1 only stores it.
+    """
+
+    __tablename__ = "basis_observations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    futures_price: Mapped[float] = mapped_column(Float)
+    spot_price: Mapped[float] = mapped_column(Float)
+    basis: Mapped[float] = mapped_column(Float)
+    futures_provider: Mapped[str] = mapped_column(String(64), default="Yahoo Finance (GC=F)")
+    spot_provider: Mapped[str] = mapped_column(String(64), default="Gold API")
+    futures_symbol: Mapped[str] = mapped_column(String(32), default="GC=F")
+    spot_symbol: Mapped[str] = mapped_column(String(32), default="XAU")
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class HistoricalSyncState(Base):
@@ -50,6 +92,9 @@ class HistoricalSyncState(Base):
     Records the last successful backfill, the earliest/latest candle
     timestamps the provider returned, the total candle count, and the
     last error (if any). Drives the /api/data/* endpoints.
+
+    Phase 3.1: also tracks instrument + derivation + source/target TF
+    so the frontend /data page can show source lineage per row.
     """
 
     __tablename__ = "historical_sync_state"
@@ -67,6 +112,12 @@ class HistoricalSyncState(Base):
     total_candles: Mapped[int] = mapped_column(Integer, default=0)
     sync_status: Mapped[str] = mapped_column(String(32), default="never_synced")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 3.1: lineage metadata.
+    instrument: Mapped[str] = mapped_column(String(32), default="GC_FRONT_MONTH", index=True)
+    provider_symbol: Mapped[str] = mapped_column(String(32), default="GC=F")
+    derivation: Mapped[str] = mapped_column(String(16), default="DIRECT")
+    source_timeframe: Mapped[str] = mapped_column(String(16), default="")
+    target_timeframe: Mapped[str] = mapped_column(String(16), default="")
 
 
 class HistoricalFeatureSnapshot(Base):

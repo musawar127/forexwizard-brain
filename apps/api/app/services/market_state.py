@@ -108,6 +108,14 @@ async def refresh_quote_once() -> None:
             fresh.status if fresh else "NO_DATA",
             state.source_status,
         )
+        # Phase 3.1: opportunistically capture a basis observation if a
+        # recent GC=F futures close exists within 90s of this spot quote.
+        # This is research-only — does NOT influence Brain BUY/SELL/WAIT.
+        try:
+            await _maybe_capture_basis(quote)
+        except Exception as exc:
+            # Basis capture failures are non-fatal — never break the live feed.
+            state.last_error = (state.last_error or "") + f" | basis capture skipped: {exc}"
         now = datetime.now(timezone.utc)
         if (
             state.last_prediction_at is None
@@ -124,6 +132,60 @@ async def refresh_quote_once() -> None:
             fresh.status if fresh else "NO_DATA",
             state.source_status,
         )
+
+
+async def _maybe_capture_basis(spot_quote) -> None:
+    """Phase 3.1: research-only — when a recent GC=F futures close exists
+    within a 90s window of a fresh spot quote, persist a BasisObservation
+    row (futures_price, spot_price, basis = futures - spot).
+
+    Never raises into the caller; all errors are swallowed locally.
+    """
+    from datetime import timedelta
+    from app.db.models import BasisObservation
+    from sqlalchemy import select
+    # Find the most recent 1h historical candle (instrument=GC_FRONT_MONTH).
+    # 1h is the lowest-TF candle that is reliably populated by Yahoo backfill
+    # AND aligns reasonably with spot quote timing.
+    candles_1h = state.candles_cache.get("1h", [])
+    if not candles_1h:
+        return
+    gc_candles = [c for c in candles_1h if getattr(c, "instrument", "") == "GC_FRONT_MONTH"]
+    if not gc_candles:
+        return
+    futures_close = gc_candles[-1]
+    # Time alignment: spot quote vs futures candle timestamp.
+    spot_ts = spot_quote.market_timestamp or spot_quote.received_timestamp
+    if spot_ts.tzinfo is None:
+        spot_ts = spot_ts.replace(tzinfo=timezone.utc)
+    fut_ts = futures_close.timestamp
+    if fut_ts.tzinfo is None:
+        fut_ts = fut_ts.replace(tzinfo=timezone.utc)
+    delta = abs((spot_ts - fut_ts).total_seconds())
+    if delta > 7200:  # 2h window — don't pair stale data
+        return
+    basis = float(futures_close.close) - float(spot_quote.price)
+    with SessionLocal() as session:
+        # Avoid duplicate basis rows for the same (futures_ts, spot_ts) pair.
+        existing = session.scalar(
+            select(BasisObservation.id).where(
+                BasisObservation.timestamp == fut_ts.replace(tzinfo=None),
+            )
+        )
+        if existing is not None:
+            return
+        session.add(BasisObservation(
+            timestamp=fut_ts.replace(tzinfo=None),
+            futures_price=float(futures_close.close),
+            spot_price=float(spot_quote.price),
+            basis=basis,
+            futures_provider=futures_close.provider or "Yahoo Finance (GC=F)",
+            spot_provider=spot_quote.provider or "Gold API",
+            futures_symbol=futures_close.provider_symbol or "GC=F",
+            spot_symbol="XAU",
+            captured_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        ))
+        session.commit()
 
 
 async def refresh_research_once() -> None:

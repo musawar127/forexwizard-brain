@@ -272,3 +272,86 @@ Provider limitations (documented on /data page):
 Stage Summary:
 - Phase 3 complete. Genuine XAU/USD historical memory now persists across M1, M5, M15, M30, H1, H4, D1. 8,435 real candles stored. 10-year D1 history. Brain BUY/SELL/WAIT logic unchanged but now reads richer history. New /data page exposes full data quality, provider health, sync state, gap detection. 27 new tests (30 total). Build clean.
 - Phase 4 NOT started.
+
+---
+Task ID: 5 (Phase 3.1)
+Agent: main
+Task: Strengthen historical data before learning. Use native Yahoo intervals. Separate instruments. Add source lineage + basis + historical depth.
+
+Work Log:
+- Verified Yahoo's actual empirically-supported ranges: M1=5d, M5/M15/M30=1mo (NOT 3mo as Phase 3 docs claimed — Yahoo returns 422 for >1mo on these TFs), H1=2y, D1=10y. Updated YAHOO_DEFAULT_RANGES accordingly.
+
+Backend code modified (6 files):
+  apps/api/app/db/models.py        — added 5 lineage fields to CandleRecord (derivation, provider_symbol, instrument, source_timeframe, target_timeframe); added BasisObservation table; added 5 lineage fields to HistoricalSyncState
+  apps/api/app/db/migrations.py    — extended startup migration to ALTER TABLE for new columns AND backfill existing rows with lineage metadata (3 distinct cases: SAMPLED for Gold API, DIRECT for Yahoo/Twelve Data, AGGREGATED for derived candles)
+  apps/api/app/models/market.py    — extended Candle pydantic model with lineage fields; extended BrainAnalysis with historical_depth, instrument_consistency, technical_data_readiness fields
+  apps/api/app/engine/analysis.py  — added _full_historical_depth_days() that queries HistoricalSyncState for FULL DB range (not just 120 recent candles); added _instrument_consistency() classifier (PURE_GC/PURE_SPOT/MIXED/NONE); SCORING LOGIC UNCHANGED — 0 lines of BUY/SELL/WAIT rules modified
+  apps/api/app/engine/candles.py   — get_candles() now propagates lineage fields from CandleRecord rows to Candle objects (was missing them)
+  apps/api/app/main.py             — added GET /api/data/basis endpoint (research-only, no trading logic); updated /api/data/gaps to filter by is_historical flag rather than provider-string matching
+
+Backend code rewritten (4 files):
+  apps/api/app/services/historical/sync.py            — REWROTE: each native TF fetched DIRECTLY from Yahoo (M1, M5, M15, M30, H1, D1) at Yahoo's verified deepest native range. Only H4 is derived locally from H1. All candles tagged with full lineage (derivation=DIRECT/AGGREGATED, provider_symbol=GC=F, instrument=GC_FRONT_MONTH, source_timeframe, target_timeframe).
+  apps/api/app/services/historical/yahoo_finance.py   — updated YAHOO_DEFAULT_RANGES to match Yahoo's actual limits; every Candle returned now carries full lineage (DIRECT / GC=F / GC_FRONT_MONTH / source=target=interval)
+  apps/api/app/services/historical/aggregator.py      — aggregate_candles() now preserves lineage fields: derivation=AGGREGATED, instrument inherited from source candles, source_timeframe=target TF (lower), target_timeframe=source TF (higher)
+  apps/api/app/services/historical/data_quality.py    — by_interval now a dict keyed by interval, each value is a list of (instrument, derivation)-grouped entries; added interval_quality dict with historical_depth_days + instrument_consistency per TF; added _historical_depth_for_tf() that reads from HistoricalSyncState for full DB range
+
+Backend code added (1 file):
+  apps/api/app/services/market_state.py — extended refresh_quote_once() to opportunistically call _maybe_capture_basis() which stores a BasisObservation row when both a GC=F futures close and a fresh XAU/USD spot quote exist within a 2h window. Research-only — does NOT influence BUY/SELL/WAIT.
+
+Backend tests (modified 3 + new 1):
+  apps/api/tests/test_historical_sync.py        — REWROTE to match Phase 3.1 design (each native TF fetched directly; H4 derived from H1). 5 tests.
+  apps/api/tests/test_data_quality.py           — updated for new dict-keyed by_interval structure. 4 tests.
+  apps/api/tests/test_historical_lineage.py     — NEW: 11 tests for instrument separation, provider-symbol lineage, DIRECT vs AGGREGATED, native interval selection, H1→H4 aggregation, historical-depth calculation, mixed-instrument detection.
+
+Frontend code (modified 3 files):
+  apps/web/lib/types.ts            — extended types with IntervalLineageRow, IntervalQuality, BrainAnalysisExtras; added historical_depth + instrument_consistency + technical_data_readiness to BrainAnalysis
+  apps/web/components/Nav.tsx      — unchanged (added /data in Phase 3)
+  apps/web/app/data/page.tsx       — REWROTE: now renders 12-column per-lineage table (TF, Instrument, Provider, Provider Symbol, Derivation, Source→Target, Candles, First, Last, Days, Dup, Integrity) + separate Interval Quality table with historical depth + instrument consistency + missing intervals + completeness + integrity status
+
+Real historical sync re-run (Phase 3.1 design — native intervals fetched directly):
+  M1:   4,856 candles DIRECT  range=5d    (2026-09-18 → 2026-09-23) — UNCHANGED from Phase 3 (already at native max)
+  M5:   5,935 candles DIRECT  range=1mo  (2026-08-23 → 2026-09-23) — was 897 candles (5d derived from M1) in Phase 3. 6.6x more candles.
+  M15:  1,983 candles DIRECT  range=1mo  (2026-08-23 → 2026-09-23) — was 299 candles (5d derived) in Phase 3. 6.6x more.
+  M30:    992 candles DIRECT  range=1mo  (2026-08-23 → 2026-09-23) — was 149 candles (5d derived) in Phase 3. 6.7x more.
+  H1:  11,462 candles DIRECT  range=2y   (2024-09-23 → 2026-09-23) — was 74 candles (5d derived) in Phase 3. 155x more candles!
+  H4:   3,103 candles AGGREGATED (from H1) range=2y (2024-09-23 → 2026-09-23) — was 20 candles in Phase 3. 155x more.
+  D1:   2,513 candles DIRECT  range=10y  (2016-09-23 → 2026-09-23) — UNCHANGED (already at native max)
+  Total: 30,844 genuine candles (was 8,435 in Phase 3 — 3.66x more genuine history)
+
+Lineage verified across all 7 timeframes:
+  - All native TFs (M1, M5, M15, M30, H1, D1): derivation=DIRECT, source_timeframe=target_timeframe=interval, instrument=GC_FRONT_MONTH, provider_symbol=GC=F
+  - H4: derivation=AGGREGATED, source_timeframe=1h, target_timeframe=4h, instrument=GC_FRONT_MONTH (inherited from H1), provider_symbol=GC=F
+
+Brain analysis (Phase 3.1 — historical depth + instrument consistency exposed, scoring logic UNCHANGED):
+  decision: SELL
+  confidence: 91.9% (same rules-v0.1 formula; 5 of 6 TFs BEARISH with stretched-low RSI)
+  technical_data_readiness: 100.0% (all 6 TFs READY)
+  instrument_consistency: MIXED (Brain correctly detects both GC_FRONT_MONTH historical + XAUUSD_SPOT sampled candles)
+  historical_depth:
+    M1: 5.51 days  (matches user spec: "M1 historical depth: 5 days")
+    M5/M15/M30: 30.76 days each  (matches: 1mo native range)
+    H1: 730.01 days  (matches: "H1 historical depth: 2 years")
+    H4: 730.0 days   (matches: 2y derived from H1)
+    D1: 3,652 days  (matches: "D1 historical depth: 10 years")
+
+Tests: 43 passed (was 30 pre-Phase 3.1 — net +13 tests)
+Typecheck: 0 errors
+Next build: success — 8 routes prerendered as static
+
+Basis observations: capture loop integrated into refresh_quote_once() — fires when spot quote arrives AND a recent GC=F futures close (from cached 1h historical candles) exists within 2h window. Research-only storage; never feeds into BUY/SELL/WAIT.
+
+Preserved (as required):
+  - BUY/SELL/WAIT rules-v0.1 logic — UNCHANGED, 0 lines of scoring code modified
+  - XAU/USD spot Gold API feed — still samples every 30s, still tagged XAUUSD_SPOT
+  - Candle aggregation system, prediction memory, outcome evaluation, research, DB models (existing tables preserved)
+  - No real-money trading
+  - No fake candles or synthetic history
+
+Not implemented (as required):
+  - No historical pattern learning
+  - No strategy optimization
+  - No BUY/SELL/WAIT logic modifications based on historical statistics
+
+Stage Summary:
+- Phase 3.1 complete. 30,844 genuine historical candles (3.66x Phase 3's 8,435) with full source lineage. Each TF now uses Yahoo's native interval directly (M5/M15/M30 went from 5d derived to 30d direct; H1 went from 5d derived to 2y direct). H4 is the only derived TF (from H1). Brain BUY/SELL/WAIT logic unchanged but now reports historical_depth + instrument_consistency + technical_data_readiness as separate read-only context fields. New /data page renders 12-column per-lineage table + separate interval-quality table. 43 tests pass. Build clean.
+- Phase 4 NOT started.

@@ -27,6 +27,14 @@ class Candle(BaseModel):
     volume: float | None = None
     sample_count: int = 1
     provider: str = "Local sampled Gold API"
+    # Phase 3.1: source lineage. Defaults preserve backward compatibility
+    # for the live Gold API sampler (SAMPLED / XAUUSD_SPOT / TICK source).
+    is_historical: bool = False
+    derivation: str = "SAMPLED"  # DIRECT | AGGREGATED | SAMPLED
+    provider_symbol: str = "XAU"
+    instrument: str = "XAUUSD_SPOT"
+    source_timeframe: str = "TICK"
+    target_timeframe: str | None = None  # None means "same as interval"
 
 
 class Zone(BaseModel):
@@ -67,6 +75,15 @@ class BrainAnalysis(BaseModel):
     data_quality: str
     message: str
     brain_version: str = "rules-v0.1"
+    # Phase 3.1: separate "technical readiness" (rule agreement) from
+    # "historical depth" (how many days of genuine history back each TF)
+    # and "instrument consistency" (PURE_GC / PURE_SPOT / MIXED / NONE).
+    # These are read-only context fields. They do NOT influence the
+    # BUY/SELL/WAIT decision — only clarify what the confidence number
+    # is actually backed by.
+    historical_depth: dict[str, float] = Field(default_factory=dict)
+    instrument_consistency: str = "NONE"  # PURE_GC | PURE_SPOT | MIXED | NONE
+    technical_data_readiness: float = 0.0
 
 
 class AskRequest(BaseModel):

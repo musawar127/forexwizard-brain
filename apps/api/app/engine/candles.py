@@ -131,6 +131,16 @@ async def get_candles(interval: str, limit: int = 200, symbol: str = "XAU/USD") 
             volume=r.volume,
             sample_count=r.sample_count,
             provider=r.provider,
+            # Phase 3.1: propagate lineage fields so the Brain analysis can
+            # classify candles by instrument (PURE_GC vs MIXED) and compute
+            # historical_depth correctly. Defaults preserve backward
+            # compatibility for rows created before Phase 3.1.
+            is_historical=bool(getattr(r, "is_historical", False)),
+            derivation=getattr(r, "derivation", None) or "SAMPLED",
+            provider_symbol=getattr(r, "provider_symbol", None) or "XAU",
+            instrument=getattr(r, "instrument", None) or "XAUUSD_SPOT",
+            source_timeframe=getattr(r, "source_timeframe", None) or "TICK",
+            target_timeframe=getattr(r, "target_timeframe", None) or r.interval,
         )
         for r in rows
     ]
