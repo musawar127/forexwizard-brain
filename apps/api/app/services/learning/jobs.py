@@ -189,6 +189,10 @@ def get_job(job_id: str) -> dict | None:
             "error_message": job.error_message,
             "elapsed_seconds": job.elapsed_seconds,
             "states_per_second": job.states_per_second,
+            "db_state_count": getattr(job, "db_state_count", None),
+            "counter_state_count": getattr(job, "counter_state_count", None),
+            "counter_db_difference": getattr(job, "counter_db_difference", None),
+            "reconciliation_warning": getattr(job, "reconciliation_warning", None),
         }
 
 

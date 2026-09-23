@@ -188,3 +188,66 @@ def run_startup_migrations() -> None:
             ))
     except Exception as exc:
         log.warning("migration: BuildJob cleanup failed (non-fatal): %s", exc)
+
+    # 7. Phase 4.3: add outcome resolution metadata columns to HistoricalOutcome.
+    try:
+        inspector = inspect(engine)
+        if "historical_outcomes" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("historical_outcomes")}
+            needed = [
+                ("outcome_source_timeframe", "VARCHAR(16)"),
+                ("outcome_source_provider", "VARCHAR(64)"),
+                ("outcome_source_instrument", "VARCHAR(32)"),
+                ("resolution_sufficient", "BOOLEAN"),
+                ("outcome_version", "VARCHAR(16) DEFAULT 'outcomes-v0.1' NOT NULL"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE historical_outcomes ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to historical_outcomes", col_name)
+            # Backfill: existing outcomes used H1 for all horizons (outcomes-v0.1)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE historical_outcomes SET outcome_version='outcomes-v0.1' "
+                    "WHERE outcome_version IS NULL OR outcome_version='outcomes-v0.1'"
+                ))
+    except Exception as exc:
+        log.warning("migration: HistoricalOutcome Phase 4.3 column check failed: %s", exc)
+
+    # 8. Phase 4.3: add outcome_version to SimilarityRun.
+    try:
+        inspector = inspect(engine)
+        if "similarity_runs" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("similarity_runs")}
+            if "outcome_version" not in columns:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "ALTER TABLE similarity_runs ADD COLUMN outcome_version VARCHAR(16) DEFAULT 'outcomes-v0.1' NOT NULL"
+                    ))
+                log.info("migration: added outcome_version column to similarity_runs")
+    except Exception as exc:
+        log.warning("migration: SimilarityRun outcome_version check failed: %s", exc)
+
+    # 9. Phase 4.3: add reconciliation fields to BuildJob.
+    try:
+        inspector = inspect(engine)
+        if "build_jobs" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("build_jobs")}
+            needed = [
+                ("db_state_count", "INTEGER"),
+                ("counter_state_count", "INTEGER"),
+                ("counter_db_difference", "INTEGER"),
+                ("reconciliation_warning", "TEXT"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE build_jobs ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to build_jobs", col_name)
+    except Exception as exc:
+        log.warning("migration: BuildJob reconciliation column check failed: %s", exc)

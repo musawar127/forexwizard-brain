@@ -54,6 +54,12 @@ from __future__ import annotations
 from app.services.learning.config import LearningConfig, FeatureWeights, NEUTRAL_X_DEFAULT, HORIZON_MINUTES
 from app.services.learning.states import HistoricalStateBuilder, FeatureVector
 from app.services.learning.outcomes import OutcomeCalculator
+from app.services.learning.resolution_rules import (
+    HORIZON_RESOLUTION_RULES,
+    OUTCOME_VERSION_V02,
+    is_resolution_sufficient,
+    select_best_source_timeframe,
+)
 from app.services.learning.roll_detector import detect_roll_between, outcome_window_valid
 from app.services.learning.similarity import SimilarityEngine, SimilarityResult, NeighborMatch
 from app.services.learning.statistics import StatisticsAggregator, SampleQuality, StatisticsSummary

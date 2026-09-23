@@ -48,6 +48,12 @@ from app.services.learning.jobs import (
     update_job_progress,
 )
 from app.services.learning.outcomes import OutcomeCalculator
+from app.services.learning.resolution_rules import (
+    OUTCOME_VERSION_V02,
+    HORIZON_RESOLUTION_RULES,
+    is_resolution_sufficient,
+    select_best_source_timeframe,
+)
 from app.services.learning.roll_detector import detect_roll_between, outcome_window_valid
 from app.services.learning.similarity import NeighborMatch, SimilarityEngine
 from app.services.learning.states import FeatureVector, HistoricalStateBuilder
@@ -370,8 +376,54 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
                     excluded_roll += 1
 
                 # Compute outcomes at each horizon (synchronous)
+                # Phase 4.3: fetch forward candles for ALL TFs for multi-resolution lookup
                 forward_idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
                 h1_forward = h1_instrument[forward_idx:]
+                all_forward_by_tf = {"1h": h1_forward}
+                for tf_name, tf_candles in [("1min", None), ("5min", None), ("15min", None), ("30min", None), ("4h", None), ("1day", None)]:
+                    pass  # placeholder — actual multi-TF fetch done below
+                # Fetch forward candles for sub-hour TFs from the pre-loaded data
+                for tf_data, tf_name in [(h1_instrument, "1h")]:
+                    pass  # H1 already in all_forward_by_tf
+                # For sub-hour TFs, use the pre-loaded candle lists (all_h1_raw contains all intervals)
+                # Actually, we need separate lists per TF. Let's build them from the pre-loaded data.
+                # The all_h1_raw list contains ALL candles (all intervals mixed by symbol).
+                # We already have h1_instrument, h4_instrument, d1_instrument.
+                # For M1/M5/M15/M30, we need to fetch them from the DB.
+                # Phase 4.3: fetch M1/M5/M15/M30 forward candles if available
+                try:
+                    from app.db.models import CandleRecord as CR
+                    from sqlalchemy import select as sa_sel
+                    with SessionLocal() as sess:
+                        for tf_name in ["1min", "5min", "15min", "30min"]:
+                            rows = sess.scalars(sa_sel(CR).where(
+                                CR.symbol == "XAU/USD", CR.interval == tf_name,
+                                CR.timestamp > ts_utc.replace(tzinfo=None),
+                            ).order_by(CR.timestamp.asc()).limit(5000)).all()
+                            if rows:
+                                all_forward_by_tf[tf_name] = [
+                                    Candle(symbol=r.symbol, interval=r.interval,
+                                           timestamp=_ensure_utc(r.timestamp),
+                                           open=r.open, high=r.high, low=r.low, close=r.close,
+                                           volume=r.volume, sample_count=r.sample_count,
+                                           provider=r.provider,
+                                           is_historical=r.is_historical,
+                                           derivation=getattr(r, "derivation", "DIRECT") or "DIRECT",
+                                           provider_symbol=getattr(r, "provider_symbol", "GC=F") or "GC=F",
+                                           instrument=getattr(r, "instrument", "GC_FRONT_MONTH") or "GC_FRONT_MONTH",
+                                           source_timeframe=getattr(r, "source_timeframe", tf_name) or tf_name,
+                                           target_timeframe=getattr(r, "target_timeframe", tf_name) or tf_name,
+                                    ) for r in rows
+                                ]
+                except Exception:
+                    pass  # multi-TF fetch is best-effort
+                # Also add H4 and D1 forward
+                h4_forward = [ck for ck in h4_instrument if ck.timestamp > ts_utc]
+                if h4_forward:
+                    all_forward_by_tf["4h"] = h4_forward
+                d1_forward = [ck for ck in d1_instrument if ck.timestamp > ts_utc]
+                if d1_forward:
+                    all_forward_by_tf["1day"] = d1_forward
                 outcomes = _compute_outcomes_inline(
                     ts_utc=ts_utc,
                     state_price=c.close,
@@ -380,6 +432,7 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
                     horizons=HORIZON_MINUTES,
                     neutral_x=cfg.neutral_x,
                     max_elapsed_multiple=cfg.max_elapsed_multiple,
+                    all_forward_by_tf=all_forward_by_tf,
                 )
                 for h, w in outcomes.items():
                     session.add(HistoricalOutcome(
@@ -399,11 +452,18 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
                         invalid_reason=w.get("invalid_reason"),
                         possible_contract_roll=possible_roll,
                         roll_gap_size=roll_gap,
-                        excluded_from_learning=possible_roll or not w.get("horizon_valid", True),
+                        excluded_from_learning=possible_roll or not w.get("horizon_valid", True) or not w.get("resolution_sufficient", True),
                         exclusion_reason=(
                             "CONTRACT_ROLL_BOUNDARY" if possible_roll
                             else ("INVALID_HORIZON_WINDOW" if not w.get("horizon_valid", True) else None)
+                            if w.get("resolution_sufficient", True)
+                            else "INSUFFICIENT_RESOLUTION"
                         ),
+                        outcome_source_timeframe=w.get("outcome_source_timeframe"),
+                        outcome_source_provider=w.get("outcome_source_provider"),
+                        outcome_source_instrument=w.get("outcome_source_instrument"),
+                        resolution_sufficient=w.get("resolution_sufficient"),
+                        outcome_version=w.get("outcome_version", "outcomes-v0.1"),
                     ))
                     outcomes_built += 1
 
@@ -435,6 +495,23 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
 
         elapsed = time.monotonic() - started_at
         sps = round(states_built / elapsed, 2) if elapsed > 0 and states_built > 0 else None
+        # Phase 4.3: DB-as-source-of-truth reconciliation
+        with SessionLocal() as recon_session:
+            from sqlalchemy import func as sa_func
+            db_count = recon_session.scalar(
+                sa_func.count(HistoricalMarketState.id).where(
+                    HistoricalMarketState.instrument == instrument,
+                    HistoricalMarketState.base_timeframe == base_timeframe,
+                    HistoricalMarketState.feature_version == cfg.feature_version,
+                )
+            ) or 0
+        counter_count = states_built + skipped_existing
+        diff = db_count - counter_count
+        recon_warning = None
+        final_status = "completed"
+        if diff != 0:
+            final_status = "completed_with_reconciliation_warning"
+            recon_warning = f"DB has {db_count} states, counter says {counter_count} (diff={diff})"
         update_job_progress(
             job_id,
             built=states_built,
@@ -442,13 +519,26 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
             excluded_roll=excluded_roll,
             excluded_gaps=excluded_gaps,
             excluded_insufficient_future=excluded_insufficient_future,
-            status="completed",
+            status=final_status,
             last_checkpoint_ts=latest_ts,
             earliest_state=earliest_ts,
             latest_state=latest_ts,
             elapsed_seconds=elapsed,
             states_per_second=sps,
         )
+        # Persist reconciliation fields
+        try:
+            with SessionLocal() as rs:
+                from app.db.models import BuildJob as BJ
+                job_row = rs.scalar(sa_sel(BJ).where(BJ.job_id == job_id))
+                if job_row:
+                    job_row.db_state_count = db_count
+                    job_row.counter_state_count = counter_count
+                    job_row.counter_db_difference = diff
+                    job_row.reconciliation_warning = recon_warning
+                    rs.commit()
+        except Exception:
+            pass
         mark_job_completed(job_id, elapsed_seconds=elapsed)
 
     except Exception as exc:
@@ -685,38 +775,56 @@ async def _run_build_job(
 
 def _compute_outcomes_inline(
     *,
-    ts_utc: datetime,
-    state_price: float,
-    state_atr: float | None,
-    h1_forward: list,
-    horizons: tuple[int, ...],
-    neutral_x: float,
-    max_elapsed_multiple: float,
-) -> dict[int, dict]:
-    """Compute outcome windows at each horizon. Returns dict keyed by horizon.
-    Stores CANONICAL max_up_move + max_down_move (direction-neutral)."""
+    ts_utc,
+    state_price,
+    state_atr,
+    h1_forward,
+    horizons,
+    neutral_x,
+    max_elapsed_multiple,
+    all_forward_by_tf=None,
+):
+    """Phase 4.3: Multi-resolution outcome lookup. For each horizon, selects
+    the best available source timeframe (M1 preferred for 15m, M5 for 30m,
+    H1 for 60m+). Falls back to H1 if no finer TF is available."""
     h1_seconds = INTERVALS["1h"]
-    results: dict[int, dict] = {}
+    results = {}
+    available_tfs = list(all_forward_by_tf.keys()) if all_forward_by_tf else ["1h"]
+
     for horizon in horizons:
-        candles_needed = max(1, horizon * 60 // h1_seconds)
-        if len(h1_forward) < candles_needed:
+        source_tf, res_sufficient = select_best_source_timeframe(horizon, available_tfs)
+        if source_tf is None or not res_sufficient:
+            source_tf = "1h"
+            res_sufficient = False
+
+        if all_forward_by_tf and source_tf in all_forward_by_tf:
+            forward_candles = all_forward_by_tf[source_tf]
+        else:
+            forward_candles = h1_forward
+
+        source_seconds = INTERVALS.get(source_tf, h1_seconds)
+        candles_needed = max(1, horizon * 60 // source_seconds)
+
+        if len(forward_candles) < candles_needed:
             results[horizon] = {
                 "horizon_valid": False,
-                "invalid_reason": "insufficient forward data",
+                "invalid_reason": f"insufficient {source_tf} forward data",
                 "direction": "NULL",
+                "outcome_source_timeframe": source_tf,
+                "resolution_sufficient": res_sufficient,
+                "outcome_version": OUTCOME_VERSION_V02 if all_forward_by_tf else "outcomes-v0.1",
             }
             continue
-        window = h1_forward[:candles_needed]
+
+        window = forward_candles[:candles_needed]
         future_price = window[-1].close
         absolute_change = future_price - state_price
         percentage_change = (absolute_change / state_price) * 100.0 if state_price > 0 else None
         max_high = max(c.high for c in window)
         min_low = min(c.low for c in window)
-        # Phase 4.1: canonical direction-neutral excursions
-        max_up_move = round(max_high - state_price, 4)  # >= 0
-        max_down_move = round(state_price - min_low, 4)  # >= 0
+        max_up_move = round(max_high - state_price, 4)
+        max_down_move = round(state_price - min_low, 4)
 
-        # Direction classification — volatility-aware
         if state_atr is not None and state_atr > 0:
             normalized = abs(absolute_change) / state_atr
             if normalized < neutral_x:
@@ -730,17 +838,11 @@ def _compute_outcomes_inline(
             else:
                 direction = "UP" if absolute_change > 0 else "DOWN"
 
-        # Phase 4.1: window validity check (Friday 20:30 + 4h must not be
-        # Sunday/Monday pricing silently)
         valid, actual_elapsed, invalid_reason = outcome_window_valid(
             ts_utc, window, horizon_minutes=horizon,
             max_elapsed_multiple=max_elapsed_multiple,
         )
 
-        # Legacy mfe/mae fields (direction-agnostic — preserved for backward
-        # compat; new code uses max_up_move/max_down_move + direction).
-        # For Phase 4 backward compat, store mfe = max(max_up_move, max_down_move)
-        # and mae = min(max_up_move, max_down_move). This is the Phase 4 semantic.
         legacy_mfe = max(max_up_move, max_down_move)
         legacy_mae = min(max_up_move, max_down_move)
 
@@ -750,12 +852,17 @@ def _compute_outcomes_inline(
             "percentage_change": round(percentage_change, 4) if percentage_change is not None else None,
             "max_up_move": max_up_move,
             "max_down_move": max_down_move,
-            "mfe": legacy_mfe,         # legacy field
-            "mae": legacy_mae,          # legacy field
+            "mfe": legacy_mfe,
+            "mae": legacy_mae,
             "direction": direction,
             "horizon_valid": valid,
             "actual_elapsed_seconds": actual_elapsed,
             "invalid_reason": invalid_reason if not valid else None,
+            "outcome_source_timeframe": source_tf,
+            "outcome_source_provider": "Yahoo Finance (GC=F)",
+            "outcome_source_instrument": "GC_FRONT_MONTH",
+            "resolution_sufficient": res_sufficient,
+            "outcome_version": OUTCOME_VERSION_V02 if all_forward_by_tf else "outcomes-v0.1",
         }
     return results
 
@@ -1155,6 +1262,7 @@ def _persist_similarity_run(result: dict, cfg: LearningConfig, run_id: str) -> N
                 effective_history_end=_to_naive(eff.get("effective_history_end")),
                 effective_days=eff.get("effective_days"),
                 probability_calibrated=False,
+                outcome_version=OUTCOME_VERSION_V02,
             ))
             session.commit()
     except Exception:
@@ -1312,6 +1420,7 @@ def get_run(run_id: str) -> dict | None:
             "effective_days": run.effective_days,
         },
         "probability_calibrated": run.probability_calibrated,
+        "outcome_version": getattr(run, "outcome_version", "outcomes-v0.1"),
     }
 
 
@@ -1375,6 +1484,7 @@ async def learning_status() -> dict:
                 "total_outcomes": total,
                 "valid_outcomes": valid if valid is not None else 0,
                 "excluded_outcomes": excluded if excluded is not None else 0,
+                "resolution_rules": HORIZON_RESOLUTION_RULES.get(h, []),
             }
             for h, total, valid, excluded in by_horizon
         ],
@@ -1397,6 +1507,7 @@ async def learning_status() -> dict:
                 "median_selected_similarity": r.median_selected_similarity,
                 "lowest_similarity": r.lowest_selected_similarity,
                 "effective_days": r.effective_days,
+                "outcome_version": getattr(r, "outcome_version", "outcomes-v0.1"),
             }
             for r in recent_runs
         ],

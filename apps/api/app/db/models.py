@@ -342,6 +342,15 @@ class HistoricalOutcome(Base):
     roll_gap_size: Mapped[float | None] = mapped_column(Float, nullable=True)
     excluded_from_learning: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     exclusion_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Phase 4.3: outcome resolution metadata — explicitly record which
+    # source timeframe/provider/instrument was used to compute this outcome.
+    # This prevents the 15m/30m issue where H1 candles were incorrectly
+    # used for sub-hour horizons.
+    outcome_source_timeframe: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    outcome_source_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    outcome_source_instrument: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resolution_sufficient: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    outcome_version: Mapped[str] = mapped_column(String(16), default="outcomes-v0.1")
 
 
 class SimilarityRun(Base):
@@ -394,6 +403,10 @@ class SimilarityRun(Base):
     effective_days: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     probability_calibrated: Mapped[bool] = mapped_column(Boolean, default=False)  # ALWAYS False in Phase 4.1
+    # Phase 4.3: outcome_version — tracks which outcome computation version
+    # the statistics were based on. Old runs keep outcomes-v0.1 (H1 for all
+    # horizons); new runs use outcomes-v0.2 (correct source TF per horizon).
+    outcome_version: Mapped[str] = mapped_column(String(16), default="outcomes-v0.1")
 
 
 class BuildJob(Base):
@@ -431,3 +444,11 @@ class BuildJob(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     states_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Phase 4.3: DB-as-source-of-truth reconciliation fields.
+    # At each checkpoint + completion, query the DB for the actual state
+    # count and persist it alongside the in-memory counter. If they
+    # mismatch, mark the job COMPLETED_WITH_RECONCILIATION_WARNING.
+    db_state_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    counter_state_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    counter_db_difference: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reconciliation_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
