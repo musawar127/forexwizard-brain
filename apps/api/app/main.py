@@ -588,11 +588,19 @@ async def api_forward_observation_detail(observation_id: str):
 
 
 @app.post("/api/forward/capture")
-async def api_forward_capture():
+async def api_forward_capture(
+    payload: dict | None = None,
+):
     """Manually trigger a forward observation capture at the current market
     state. Also called automatically by the capture scheduler at M15/H1
-    candle closes."""
-    result = await capture_observation()
+    candle closes.
+
+    Body: {"capture_timeframe": "15min" or "1h"} (default: "15min")
+    """
+    tf = "15min"
+    if payload and payload.get("capture_timeframe"):
+        tf = payload["capture_timeframe"]
+    result = await capture_observation(capture_timeframe=tf)
     if result.get("skipped"):
         return result
     return result

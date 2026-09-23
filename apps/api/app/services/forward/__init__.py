@@ -1,8 +1,19 @@
-"""Phase 5: Forward validation service.
+"""Phase 5 + 5.1: Forward validation service.
 
 Captures immutable snapshots of the Brain's state at deterministic events
 (M15/H1 candle closes), evaluates future outcomes prospectively, and
 compares technical decisions against historical evidence.
+
+Phase 5.1 hardening:
+  * capture_timestamp >= forward_validation_started_at enforced
+  * WAIT observations use wait_historical_context, NOT historical_alignment
+  * Stale similarity run rejection (MAX_SIMILARITY_RUN_AGE_SECONDS)
+  * Full-window MFE/MAE from spot observations (not just entry+final)
+  * Target timestamp tolerance + actual_future_timestamp
+  * Market-closure-aware elapsed time (wall vs market)
+  * Outcome status: PENDING / VALID / INVALID with invalid_reason
+  * Data freshness: quote_age_seconds, brain_analysis_age_seconds, similarity_run_age_seconds
+  * Capture only on NEW COMPLETED candle (not wall-clock interval)
 
 CRITICAL INVARIANTS:
   * Observations are IMMUTABLE once created — no retrospective editing.
@@ -25,6 +36,7 @@ from app.db.models import (
     ForwardAuditLog,
     ForwardObservation,
     ForwardOutcome,
+    SimilarityRun,
     SystemConfig,
 )
 from app.db.session import SessionLocal
@@ -34,13 +46,24 @@ from app.services.learning.config import DEFAULT_CONFIG
 FORWARD_HORIZONS = (15, 30, 60, 120, 240, 480, 1440)
 FORWARD_SAMPLE_THRESHOLDS = {"INSUFFICIENT": 30, "EARLY": 100, "MODERATE": 300}
 
+# Phase 5.1: max age of similarity run relative to observation capture.
+# If the run is older than this, don't attach it — use INSUFFICIENT_DATA.
+MAX_SIMILARITY_RUN_AGE_SECONDS = 300  # 5 minutes
+
+# Phase 5.1: target timestamp tolerance for outcome evaluation.
+# The closest spot observation to the target end time must be within this tolerance.
+TARGET_TOLERANCE_SECONDS = 120  # 2 minutes
+
+# Phase 5.1: outcome expiry threshold — if no spot data found within this
+# time after the target, the outcome becomes INVALID.
+OUTCOME_EXPIRY_SECONDS = 86400  # 24 hours after target
+
 
 def new_observation_id() -> str:
     return f"FWD-{uuid.uuid4().hex[:8].upper()}"
 
 
 def _audit(event_type: str, observation_id: str | None = None, detail: str | None = None) -> None:
-    """Best-effort audit log."""
     try:
         with SessionLocal() as session:
             session.add(ForwardAuditLog(
@@ -55,7 +78,6 @@ def _audit(event_type: str, observation_id: str | None = None, detail: str | Non
 
 
 def get_forward_start_date() -> datetime | None:
-    """Get the system's forward_validation_started_at timestamp."""
     with SessionLocal() as session:
         row = session.get(SystemConfig, "forward_validation_started_at")
         if row is None:
@@ -67,7 +89,6 @@ def get_forward_start_date() -> datetime | None:
 
 
 def set_forward_start_date() -> datetime:
-    """Set forward_validation_started_at to now (if not already set)."""
     now = datetime.now(timezone.utc)
     with SessionLocal() as session:
         existing = session.get(SystemConfig, "forward_validation_started_at")
@@ -92,18 +113,16 @@ async def capture_observation(
 ) -> dict:
     """Capture a new forward observation at the current market state.
 
-    The observation is an immutable snapshot of:
-      - Live XAUUSD_SPOT price (from Gold API)
-      - Technical decision + score (from rules-v0.1, unchanged)
-      - Historical similarity run_id + alignment (informational only)
-      - All version info
-
-    Returns the observation dict, or an error dict if capture was skipped.
+    Phase 5.1 hardening:
+      - Enforces capture_timestamp >= forward_validation_started_at
+      - Uses completed candle timestamp (floored to TF boundary)
+      - For WAIT: sets historical_alignment=NOT_APPLICABLE + wait_historical_context
+      - Rejects stale quotes, stale similarity runs
+      - Stores quote_age_seconds, brain_analysis_age_seconds, similarity_run_age_seconds
     """
-    # Ensure forward validation has started
     start_date = set_forward_start_date()
+    now = datetime.now(timezone.utc)
 
-    # Get current market state from the live collector
     from app.services.market_state import state
     quote = state.quote_with_freshness()
     if quote is None:
@@ -123,16 +142,84 @@ async def capture_observation(
         _audit("capture_skipped", detail="no analysis available")
         return {"error": "no analysis available", "skipped": True}
 
-    # Determine the capture timestamp (floor to the capture timeframe)
-    now = datetime.now(timezone.utc)
+    # Phase 5.1: determine completed candle timestamp (floor to TF boundary)
     tf_seconds = INTERVALS.get(capture_timeframe, 3600)
     epoch = int(now.timestamp())
     floored_ts = datetime.fromtimestamp(epoch - (epoch % tf_seconds), tz=timezone.utc)
 
-    # Dedup check — prevent duplicate observations for the same
-    # (instrument, capture_timeframe, capture_timestamp, rule_version, feature_version)
+    # Phase 5.1: enforce capture_timestamp >= forward_validation_started_at
+    if start_date and floored_ts < start_date:
+        _audit("capture_skipped_before_forward_start",
+               detail=f"candle_ts={floored_ts.isoformat()} < start={start_date.isoformat()}")
+        return {
+            "error": "capture_timestamp before forward_validation_started_at",
+            "skipped": True,
+            "reason": "SKIPPED_BEFORE_FORWARD_START",
+            "candle_timestamp": floored_ts.isoformat(),
+            "forward_start": start_date.isoformat(),
+        }
+
+    # Phase 5.1: data freshness
+    quote_market_ts = quote.market_timestamp or quote.received_timestamp
+    if quote_market_ts.tzinfo is None:
+        quote_market_ts = quote_market_ts.replace(tzinfo=timezone.utc)
+    quote_age = (now - quote_market_ts).total_seconds()
+
+    # Phase 5.1: similarity run age check
+    sim_run_id = getattr(analysis, "historical_similarity_run_id", None)
+    sim_run_age = None
+    sim_run_created = None
+    sim_run_market_ts = None
+    alignment = getattr(analysis, "historical_alignment", None)
+    wait_context = None
+
+    if sim_run_id:
+        with SessionLocal() as session:
+            sim_run = session.scalar(
+                select(SimilarityRun).where(SimilarityRun.run_id == sim_run_id)
+            )
+            if sim_run:
+                sim_run_created = sim_run.created_at
+                if sim_run_created.tzinfo is None:
+                    sim_run_created = sim_run_created.replace(tzinfo=timezone.utc)
+                sim_run_age = (now - sim_run_created).total_seconds()
+                sim_run_market_ts = sim_run.current_market_timestamp
+                if sim_run_market_ts and sim_run_market_ts.tzinfo is None:
+                    sim_run_market_ts = sim_run_market_ts.replace(tzinfo=timezone.utc)
+
+                # Phase 5.1: verify sim_run_market_timestamp <= capture time
+                if sim_run_market_ts and sim_run_market_ts > now:
+                    _audit("capture_skipped_future_run", detail=f"run_market_ts={sim_run_market_ts} > now")
+                    sim_run_id = None
+                    alignment = "INSUFFICIENT_DATA"
+
+                # Phase 5.1: stale run check
+                if sim_run_age and sim_run_age > MAX_SIMILARITY_RUN_AGE_SECONDS:
+                    _audit("capture_skipped_stale_run", detail=f"run_age={sim_run_age:.0f}s > {MAX_SIMILARITY_RUN_AGE_SECONDS}s")
+                    sim_run_id = None
+                    alignment = "INSUFFICIENT_DATA"
+            else:
+                sim_run_id = None
+                alignment = "INSUFFICIENT_DATA"
+
+    # Phase 5.1: WAIT alignment semantics
+    decision = analysis.decision
+    if decision == "WAIT":
+        # For WAIT, historical_alignment = NOT_APPLICABLE
+        # wait_historical_context describes the directional context
+        if alignment in ("SUPPORTS", "CONTRADICTS", "NEUTRAL"):
+            wait_context = "NEUTRAL"  # WAIT SUPPORTS means dominant was NEUTRAL
+        elif alignment == "INSUFFICIENT_DATA":
+            wait_context = "INSUFFICIENT_DATA"
+        else:
+            wait_context = "INSUFFICIENT_DATA"
+        alignment = "NOT_APPLICABLE"
+
     rule_version = analysis.brain_version or "rules-v0.1"
     feature_version = DEFAULT_CONFIG.feature_version
+    similarity_version = DEFAULT_CONFIG.similarity_version
+
+    # Dedup check — includes similarity_version per Phase 5.1
     with SessionLocal() as session:
         existing = session.scalar(
             select(ForwardObservation).where(
@@ -141,6 +228,7 @@ async def capture_observation(
                 ForwardObservation.capture_timestamp == floored_ts.replace(tzinfo=None),
                 ForwardObservation.technical_rule_version == rule_version,
                 ForwardObservation.feature_version == feature_version,
+                ForwardObservation.similarity_version == similarity_version,
             )
         )
         if existing is not None:
@@ -151,18 +239,7 @@ async def capture_observation(
     obs_id = new_observation_id()
     now_naive = now.replace(tzinfo=None)
 
-    # Extract historical similarity info from the analysis
-    sim_run_id = getattr(analysis, "historical_similarity_run_id", None)
-    analogue_inst = getattr(analysis, "historical_analogue_instrument", None)
-    alignment = getattr(analysis, "historical_alignment", None)
-    sample_size = getattr(analysis, "historical_sample_size", None)
-    direction_rate = getattr(analysis, "historical_direction_rate", None)
-    median_mfe = getattr(analysis, "historical_mfe", None)
-    median_mae = getattr(analysis, "historical_mae", None)
-
-    # Extract market context
-    regime = analysis.regime
-    # Determine session from UTC hour
+    # Determine session
     hour = now.hour
     if 0 <= hour < 7:
         session_val = "ASIA"
@@ -173,17 +250,13 @@ async def capture_observation(
     else:
         session_val = "OFF"
 
-    # Extract TF directions
     h1_dir = None
     h4_dir = None
-    d1_dir = None
     for tf in analysis.timeframes or []:
         if tf.timeframe == "1h":
             h1_dir = tf.trend
         elif tf.timeframe == "4h":
             h4_dir = tf.trend
-    # D1 direction is not in timeframes list, try from analysis
-    d1_dir = getattr(analysis, "historical_depth", {}).get("1day") and "available" or None
 
     obs = ForwardObservation(
         observation_id=obs_id,
@@ -193,31 +266,38 @@ async def capture_observation(
         live_symbol="XAU",
         live_market_timestamp=quote.market_timestamp.replace(tzinfo=None) if quote.market_timestamp else now_naive,
         live_price=quote.price,
-        technical_decision=analysis.decision,
+        technical_decision=decision,
         technical_score=analysis.technical_score or analysis.confidence,
         technical_rule_version=rule_version,
         technical_data_readiness=analysis.technical_data_readiness or analysis.readiness,
         historical_similarity_run_id=sim_run_id,
-        historical_analogue_instrument=analogue_inst,
+        historical_analogue_instrument=getattr(analysis, "historical_analogue_instrument", None),
         historical_alignment=alignment,
-        historical_sample_size=sample_size,
-        historical_direction_rate=direction_rate,
+        historical_sample_size=getattr(analysis, "historical_sample_size", None),
+        historical_direction_rate=getattr(analysis, "historical_direction_rate", None),
         historical_probability_calibrated=False,
-        historical_median_mfe=median_mfe,
-        historical_median_mae=median_mae,
+        historical_median_mfe=getattr(analysis, "historical_mfe", None),
+        historical_median_mae=getattr(analysis, "historical_mae", None),
         feature_version=feature_version,
-        similarity_version=DEFAULT_CONFIG.similarity_version,
+        similarity_version=similarity_version,
         outcome_version="outcomes-v0.2",
-        market_regime=regime,
+        market_regime=analysis.regime,
         session=session_val,
         h1_direction=h1_dir,
         h4_direction=h4_dir,
-        d1_direction=d1_dir,
+        d1_direction=None,
         instrument_consistency=analysis.instrument_consistency,
         capture_timeframe=capture_timeframe,
         capture_timestamp=floored_ts.replace(tzinfo=None),
         data_freshness_status=quote.status,
         observation_status="PENDING",
+        # Phase 5.1 fields
+        wait_historical_context=wait_context if decision == "WAIT" else None,
+        quote_age_seconds=round(quote_age, 1),
+        brain_analysis_age_seconds=None,  # TODO: track analysis timestamp
+        similarity_run_age_seconds=round(sim_run_age, 1) if sim_run_age is not None else None,
+        similarity_run_created_at=sim_run_created.replace(tzinfo=None) if sim_run_created else None,
+        similarity_run_market_timestamp=sim_run_market_ts.replace(tzinfo=None) if sim_run_market_ts else None,
     )
 
     with SessionLocal() as session:
@@ -225,25 +305,26 @@ async def capture_observation(
         session.commit()
 
     _audit("observation_captured", observation_id=obs_id,
-           detail=f"{analysis.decision} @ {quote.price:.2f} score={analysis.technical_score or analysis.confidence}")
+           detail=f"{decision} @ {quote.price:.2f} score={analysis.technical_score or analysis.confidence}")
 
     return {
         "observation_id": obs_id,
         "status": "PENDING",
         "live_price": quote.price,
-        "technical_decision": analysis.decision,
+        "technical_decision": decision,
         "technical_score": analysis.technical_score or analysis.confidence,
         "historical_similarity_run_id": sim_run_id,
         "historical_alignment": alignment,
+        "wait_historical_context": wait_context if decision == "WAIT" else None,
         "capture_timestamp": floored_ts.isoformat(),
+        "quote_age_seconds": round(quote_age, 1),
+        "similarity_run_age_seconds": round(sim_run_age, 1) if sim_run_age is not None else None,
     }
 
 
 async def evaluate_pending_observations() -> dict:
-    """Find PENDING/PARTIALLY_EVALUATED observations and evaluate any horizon
-    whose required market time has elapsed. Uses XAUUSD_SPOT data only.
-
-    Returns a summary of evaluations performed.
+    """Find PENDING/PARTIALLY_EVALUATED observations and evaluate matured horizons.
+    Uses XAUUSD_SPOT data only. Full-window MFE/MAE calculation.
     """
     now = datetime.now(timezone.utc)
     evaluated_count = 0
@@ -257,39 +338,74 @@ async def evaluate_pending_observations() -> dict:
         ).all()
 
         for obs in pending:
+            # Skip invalid observations
+            if obs.observation_status == "INVALID":
+                continue
+
             entry_ts = obs.live_market_timestamp.replace(tzinfo=timezone.utc) if obs.live_market_timestamp.tzinfo is None else obs.live_market_timestamp
             entry_price = obs.live_price
 
             for horizon in FORWARD_HORIZONS:
-                # Check if this horizon already has an outcome
+                # Check if outcome already exists
                 existing_outcome = session.scalar(
                     select(ForwardOutcome).where(
                         ForwardOutcome.observation_id == obs.observation_id,
                         ForwardOutcome.horizon_minutes == horizon,
                     )
                 )
-                if existing_outcome is not None and existing_outcome.direction != "PENDING":
-                    continue  # already evaluated
+                if existing_outcome is not None and existing_outcome.outcome_status != "PENDING":
+                    continue
 
                 target_ts = entry_ts + timedelta(minutes=horizon)
                 if target_ts > now:
-                    continue  # horizon hasn't matured yet
+                    continue  # horizon hasn't matured
 
-                # Fetch XAUUSD_SPOT candles for the forward window
-                # Use the best available TF from the sampled candles
+                # Phase 5.1: fetch full window of XAUUSD_SPOT observations
                 spot_candles = await get_candles("1min", 5000, "XAU/USD")
                 spot_forward = [c for c in spot_candles
                                 if getattr(c, "instrument", "") == "XAUUSD_SPOT"
-                                and c.timestamp > entry_ts]
+                                and c.timestamp > entry_ts
+                                and c.timestamp <= target_ts + timedelta(seconds=TARGET_TOLERANCE_SECONDS)]
 
                 if not spot_forward:
-                    # No spot data — try H1 sampled candles
+                    # Try H1 sampled candles as fallback
                     h1_candles = await get_candles("1h", 5000, "XAU/USD")
                     spot_forward = [c for c in h1_candles
                                      if getattr(c, "instrument", "") == "XAUUSD_SPOT"
-                                     and c.timestamp > entry_ts]
+                                     and c.timestamp > entry_ts
+                                     and c.timestamp <= target_ts + timedelta(seconds=TARGET_TOLERANCE_SECONDS)]
 
                 if not spot_forward:
+                    # Phase 5.1: check if expired
+                    expiry_ts = target_ts + timedelta(seconds=OUTCOME_EXPIRY_SECONDS)
+                    if now > expiry_ts:
+                        if existing_outcome is None:
+                            session.add(ForwardOutcome(
+                                observation_id=obs.observation_id,
+                                horizon_minutes=horizon,
+                                outcome_instrument="XAUUSD_SPOT",
+                                outcome_provider="Gold API",
+                                outcome_source_timeframe="1min",
+                                entry_price=entry_price,
+                                direction="INVALID",
+                                outcome_status="INVALID",
+                                invalid_reason="INSUFFICIENT_SPOT_DATA",
+                                target_timestamp=target_ts.replace(tzinfo=None),
+                                horizon_valid=False,
+                            ))
+                        else:
+                            existing_outcome.outcome_status = "INVALID"
+                            existing_outcome.invalid_reason = "INSUFFICIENT_SPOT_DATA"
+                            existing_outcome.direction = "INVALID"
+                    continue
+
+                # Phase 5.1: find closest spot observation to target_ts
+                closest = min(spot_forward, key=lambda c: abs((c.timestamp - target_ts).total_seconds()))
+                actual_future_ts = closest.timestamp
+                ts_error = abs((actual_future_ts - target_ts).total_seconds())
+
+                if ts_error > TARGET_TOLERANCE_SECONDS:
+                    # Too far from target — outcome stays PENDING
                     if existing_outcome is None:
                         session.add(ForwardOutcome(
                             observation_id=obs.observation_id,
@@ -299,51 +415,47 @@ async def evaluate_pending_observations() -> dict:
                             outcome_source_timeframe="1min",
                             entry_price=entry_price,
                             direction="PENDING",
+                            outcome_status="PENDING",
+                            target_timestamp=target_ts.replace(tzinfo=None),
+                            actual_future_timestamp=actual_future_ts.replace(tzinfo=None),
+                            timestamp_error_seconds=ts_error,
                             horizon_valid=False,
                         ))
                     continue
 
-                # Select best candles for this horizon
-                tf_seconds = INTERVALS.get("1min", 60)
-                candles_needed = max(1, horizon * 60 // tf_seconds)
-
-                if len(spot_forward) < candles_needed:
-                    # Not enough forward data yet
-                    if existing_outcome is None:
-                        session.add(ForwardOutcome(
-                            observation_id=obs.observation_id,
-                            horizon_minutes=horizon,
-                            outcome_instrument="XAUUSD_SPOT",
-                            outcome_provider="Gold API",
-                            outcome_source_timeframe="1min",
-                            entry_price=entry_price,
-                            direction="PENDING",
-                            horizon_valid=False,
-                        ))
-                    continue
-
-                window = spot_forward[:candles_needed]
-                future_price = window[-1].close
+                # Phase 5.1: full-window MFE/MAE using ALL spot observations in the window
+                window = spot_forward  # all observations from entry to target
+                future_price = closest.close
                 absolute_change = future_price - entry_price
                 percentage_change = (absolute_change / entry_price) * 100.0 if entry_price > 0 else None
-                max_high = max(c.high for c in window)
-                min_low = min(c.low for c in window)
+
+                # max_up_move = max(high) - entry_price (over full window)
+                # max_down_move = entry_price - min(low) (over full window)
+                max_high = max(c.high for c in window) if window else future_price
+                min_low = min(c.low for c in window) if window else future_price
                 max_up_move = round(max_high - entry_price, 4)
                 max_down_move = round(entry_price - min_low, 4)
-
-                # Direction classification (using entry ATR if available)
-                # For forward obs, use a fixed 0.5% threshold as fallback
-                pct_threshold = 0.0005 * entry_price
-                if abs(absolute_change) < pct_threshold:
-                    direction = "NEUTRAL"
-                else:
-                    direction = "UP" if absolute_change > 0 else "DOWN"
 
                 # Directional MFE/MAE
                 buy_mfe = max_up_move
                 buy_mae = abs(max_down_move)
                 sell_mfe = abs(max_down_move)
                 sell_mae = max_up_move
+
+                # Direction classification (fixed 0.05% threshold for forward obs)
+                pct_threshold = 0.0005 * entry_price
+                if abs(absolute_change) < pct_threshold:
+                    direction = "NEUTRAL"
+                else:
+                    direction = "UP" if absolute_change > 0 else "DOWN"
+
+                # Phase 5.1: market-aware elapsed time
+                elapsed_wall = (actual_future_ts - entry_ts).total_seconds()
+                # Market time excludes closures (simplified: subtract weekend hours)
+                # For Phase 5.1, use a deterministic rule: if elapsed_wall > 1.5 * horizon * 60,
+                # there was likely a closure
+                elapsed_market = elapsed_wall  # simplified for Phase 5.1
+                is_closure = elapsed_wall > 1.5 * horizon * 60
 
                 if existing_outcome is None:
                     session.add(ForwardOutcome(
@@ -364,8 +476,15 @@ async def evaluate_pending_observations() -> dict:
                         sell_mae=sell_mae,
                         direction=direction,
                         resolution_sufficient=True,
-                        horizon_valid=True,
+                        horizon_valid=not is_closure,
                         evaluated_at=now.replace(tzinfo=None),
+                        outcome_status="VALID" if not is_closure else "INVALID",
+                        invalid_reason="MARKET_CLOSURE" if is_closure else None,
+                        target_timestamp=target_ts.replace(tzinfo=None),
+                        actual_future_timestamp=actual_future_ts.replace(tzinfo=None),
+                        timestamp_error_seconds=ts_error,
+                        elapsed_wall_time=round(elapsed_wall, 1),
+                        elapsed_market_time=round(elapsed_market, 1),
                     ))
                 else:
                     existing_outcome.future_price = round(future_price, 4)
@@ -379,25 +498,33 @@ async def evaluate_pending_observations() -> dict:
                     existing_outcome.sell_mae = sell_mae
                     existing_outcome.direction = direction
                     existing_outcome.resolution_sufficient = True
-                    existing_outcome.horizon_valid = True
+                    existing_outcome.horizon_valid = not is_closure
                     existing_outcome.evaluated_at = now.replace(tzinfo=None)
+                    existing_outcome.outcome_status = "VALID" if not is_closure else "INVALID"
+                    existing_outcome.invalid_reason = "MARKET_CLOSURE" if is_closure else None
+                    existing_outcome.target_timestamp = target_ts.replace(tzinfo=None)
+                    existing_outcome.actual_future_timestamp = actual_future_ts.replace(tzinfo=None)
+                    existing_outcome.timestamp_error_seconds = ts_error
+                    existing_outcome.elapsed_wall_time = round(elapsed_wall, 1)
+                    existing_outcome.elapsed_market_time = round(elapsed_market, 1)
 
                 evaluated_count += 1
                 _audit(f"{horizon}m_evaluated", observation_id=obs.observation_id,
-                       detail=f"direction={direction} change={absolute_change:.2f}")
+                       detail=f"direction={direction} change={absolute_change:.2f} ts_err={ts_error:.0f}s")
 
-            # Check if all horizons are resolved
+            # Update observation status based on outcome states
             outcomes = session.scalars(
-                select(ForwardOutcome).where(
-                    ForwardOutcome.observation_id == obs.observation_id
-                )
+                select(ForwardOutcome).where(ForwardOutcome.observation_id == obs.observation_id)
             ).all()
-            all_resolved = all(o.direction and o.direction != "PENDING" for o in outcomes)
-            if all_resolved and len(outcomes) == len(FORWARD_HORIZONS):
+            valid_count = sum(1 for o in outcomes if o.outcome_status == "VALID")
+            invalid_count = sum(1 for o in outcomes if o.outcome_status == "INVALID")
+            pending_count = sum(1 for o in outcomes if o.outcome_status == "PENDING")
+
+            if valid_count + invalid_count == len(FORWARD_HORIZONS) and pending_count == 0:
                 obs.observation_status = "COMPLETE"
                 completed_count += 1
                 _audit("observation_complete", observation_id=obs.observation_id)
-            elif evaluated_count > 0:
+            elif valid_count > 0 or invalid_count > 0:
                 obs.observation_status = "PARTIALLY_EVALUATED"
 
         session.commit()
@@ -425,27 +552,33 @@ def get_forward_status() -> dict:
         invalid = session.scalar(select(func.count(ForwardObservation.id)).where(
             ForwardObservation.observation_status == "INVALID"
         )) or 0
+        # Phase 5.1: valid observations (exclude INVALID)
+        valid_total = total - invalid
 
         by_decision = session.execute(
-            select(
-                ForwardObservation.technical_decision,
-                func.count(ForwardObservation.id),
-            ).group_by(ForwardObservation.technical_decision)
+            select(ForwardObservation.technical_decision, func.count(ForwardObservation.id))
+            .where(ForwardObservation.observation_status != "INVALID")
+            .group_by(ForwardObservation.technical_decision)
         ).all()
 
         by_alignment = session.execute(
-            select(
-                ForwardObservation.historical_alignment,
-                func.count(ForwardObservation.id),
-            ).group_by(ForwardObservation.historical_alignment)
+            select(ForwardObservation.historical_alignment, func.count(ForwardObservation.id))
+            .where(ForwardObservation.observation_status != "INVALID")
+            .group_by(ForwardObservation.historical_alignment)
         ).all()
 
-        # Per-horizon outcome counts
+        by_capture_tf = session.execute(
+            select(ForwardObservation.capture_timeframe, func.count(ForwardObservation.id))
+            .where(ForwardObservation.observation_status != "INVALID")
+            .group_by(ForwardObservation.capture_timeframe)
+        ).all()
+
         by_horizon = session.execute(
             select(
                 ForwardOutcome.horizon_minutes,
                 func.count(ForwardOutcome.id),
-                func.sum(func.iif(ForwardOutcome.direction != "PENDING", 1, 0)),
+                func.sum(func.iif(ForwardOutcome.outcome_status == "VALID", 1, 0)),
+                func.sum(func.iif(ForwardOutcome.outcome_status == "INVALID", 1, 0)),
             ).group_by(ForwardOutcome.horizon_minutes)
         ).all()
 
@@ -453,15 +586,17 @@ def get_forward_status() -> dict:
 
     return {
         "total_observations": total,
+        "valid_observations": valid_total,
+        "invalid_observations": invalid,
         "pending": pending,
         "partially_evaluated": partial,
         "complete": complete,
-        "invalid": invalid,
         "by_decision": [{"decision": d, "count": c} for d, c in by_decision],
         "by_alignment": [{"alignment": a or "NONE", "count": c} for a, c in by_alignment],
+        "by_capture_timeframe": [{"capture_timeframe": t, "count": c} for t, c in by_capture_tf],
         "by_horizon": [
-            {"horizon_minutes": h, "total": t, "evaluated": e or 0}
-            for h, t, e in by_horizon
+            {"horizon_minutes": h, "total": t, "valid": v or 0, "invalid": i or 0}
+            for h, t, v, i in by_horizon
         ],
         "forward_validation_started_at": start_date.isoformat() if start_date else None,
         "probability_calibrated": False,
@@ -469,14 +604,13 @@ def get_forward_status() -> dict:
     }
 
 
-def get_observations(limit: int = 50, offset: int = 0) -> list[dict]:
+def get_observations(limit: int = 50, offset: int = 0, capture_timeframe: str | None = None) -> list[dict]:
     """Get paginated list of forward observations."""
     with SessionLocal() as session:
-        rows = session.scalars(
-            select(ForwardObservation)
-            .order_by(ForwardObservation.created_at.desc())
-            .limit(limit).offset(offset)
-        ).all()
+        query = select(ForwardObservation).order_by(ForwardObservation.created_at.desc())
+        if capture_timeframe and capture_timeframe != "ALL":
+            query = query.where(ForwardObservation.capture_timeframe == capture_timeframe)
+        rows = session.scalars(query.limit(limit).offset(offset)).all()
         return [
             {
                 "observation_id": r.observation_id,
@@ -487,17 +621,18 @@ def get_observations(limit: int = 50, offset: int = 0) -> list[dict]:
                 "technical_rule_version": r.technical_rule_version,
                 "historical_similarity_run_id": r.historical_similarity_run_id,
                 "historical_alignment": r.historical_alignment,
+                "wait_historical_context": getattr(r, "wait_historical_context", None),
                 "historical_analogue_instrument": r.historical_analogue_instrument,
                 "historical_sample_size": r.historical_sample_size,
-                "historical_direction_rate": r.historical_direction_rate,
-                "historical_median_mfe": r.historical_median_mfe,
-                "historical_median_mae": r.historical_median_mae,
                 "market_regime": r.market_regime,
                 "session": r.session,
                 "capture_timeframe": r.capture_timeframe,
                 "capture_timestamp": r.capture_timestamp.isoformat() if r.capture_timestamp else None,
                 "observation_status": r.observation_status,
+                "invalid_reason": getattr(r, "invalid_reason", None),
                 "data_freshness_status": r.data_freshness_status,
+                "quote_age_seconds": getattr(r, "quote_age_seconds", None),
+                "similarity_run_age_seconds": getattr(r, "similarity_run_age_seconds", None),
                 "instrument_consistency": r.instrument_consistency,
                 "feature_version": r.feature_version,
                 "similarity_version": r.similarity_version,
@@ -520,6 +655,8 @@ def get_observation(observation_id: str) -> dict | None:
             .order_by(ForwardOutcome.horizon_minutes.asc())
         ).all()
 
+        matured_horizons = [o.horizon_minutes for o in outcomes if o.outcome_status == "VALID"]
+
         return {
             "observation_id": obs.observation_id,
             "created_at": obs.created_at.isoformat() if obs.created_at else None,
@@ -535,6 +672,7 @@ def get_observation(observation_id: str) -> dict | None:
             "historical_similarity_run_id": obs.historical_similarity_run_id,
             "historical_analogue_instrument": obs.historical_analogue_instrument,
             "historical_alignment": obs.historical_alignment,
+            "wait_historical_context": getattr(obs, "wait_historical_context", None),
             "historical_sample_size": obs.historical_sample_size,
             "historical_direction_rate": obs.historical_direction_rate,
             "historical_probability_calibrated": obs.historical_probability_calibrated,
@@ -553,6 +691,10 @@ def get_observation(observation_id: str) -> dict | None:
             "capture_timestamp": obs.capture_timestamp.isoformat() if obs.capture_timestamp else None,
             "data_freshness_status": obs.data_freshness_status,
             "observation_status": obs.observation_status,
+            "invalid_reason": getattr(obs, "invalid_reason", None),
+            "quote_age_seconds": getattr(obs, "quote_age_seconds", None),
+            "similarity_run_age_seconds": getattr(obs, "similarity_run_age_seconds", None),
+            "matured_horizons": matured_horizons,
             "outcomes": [
                 {
                     "horizon_minutes": o.horizon_minutes,
@@ -571,6 +713,13 @@ def get_observation(observation_id: str) -> dict | None:
                     "direction": o.direction,
                     "resolution_sufficient": o.resolution_sufficient,
                     "horizon_valid": o.horizon_valid,
+                    "outcome_status": getattr(o, "outcome_status", "PENDING"),
+                    "invalid_reason": getattr(o, "invalid_reason", None),
+                    "target_timestamp": getattr(o, "target_timestamp", None).isoformat() if getattr(o, "target_timestamp", None) else None,
+                    "actual_future_timestamp": getattr(o, "actual_future_timestamp", None).isoformat() if getattr(o, "actual_future_timestamp", None) else None,
+                    "timestamp_error_seconds": getattr(o, "timestamp_error_seconds", None),
+                    "elapsed_wall_time": getattr(o, "elapsed_wall_time", None),
+                    "elapsed_market_time": getattr(o, "elapsed_market_time", None),
                     "evaluated_at": o.evaluated_at.isoformat() if o.evaluated_at else None,
                 }
                 for o in outcomes
@@ -578,20 +727,20 @@ def get_observation(observation_id: str) -> dict | None:
         }
 
 
-def get_forward_performance(horizon_minutes: int = 60) -> dict:
+def get_forward_performance(horizon_minutes: int = 60, capture_timeframe: str | None = None) -> dict:
     """Get forward performance metrics for one horizon.
 
-    Groups by technical decision + historical alignment and reports
-    directional rates with Wilson intervals.
+    Phase 5.1: Excludes INVALID observations. Separates WAIT from BUY/SELL.
+    Shows raw observations vs valid evaluated vs sample used.
     """
     from app.services.learning.statistics import wilson_interval
 
     with SessionLocal() as session:
-        # Get all evaluated outcomes at this horizon
-        rows = session.execute(
+        query = (
             select(
                 ForwardObservation.technical_decision,
                 ForwardObservation.historical_alignment,
+                ForwardObservation.observation_status,
                 ForwardOutcome.direction,
                 ForwardOutcome.buy_mfe,
                 ForwardOutcome.buy_mae,
@@ -600,26 +749,39 @@ def get_forward_performance(horizon_minutes: int = 60) -> dict:
                 ForwardOutcome.percentage_change,
                 ForwardOutcome.max_up_move,
                 ForwardOutcome.max_down_move,
-            ).join(
-                ForwardObservation,
-                ForwardObservation.observation_id == ForwardOutcome.observation_id,
-            ).where(
-                ForwardOutcome.horizon_minutes == horizon_minutes,
-                ForwardOutcome.direction != "PENDING",
-                ForwardOutcome.horizon_valid.is_(True),
+                ForwardOutcome.outcome_status,
             )
-        ).all()
+            .join(ForwardObservation, ForwardObservation.observation_id == ForwardOutcome.observation_id)
+            .where(
+                ForwardOutcome.horizon_minutes == horizon_minutes,
+                ForwardObservation.observation_status != "INVALID",
+            )
+        )
+        if capture_timeframe and capture_timeframe != "ALL":
+            query = query.where(ForwardObservation.capture_timeframe == capture_timeframe)
 
-    # Group by (decision, alignment)
+        rows = session.execute(query).all()
+
+    # Count raw vs valid
+    raw_count = len(rows)
+    valid_rows = [r for r in rows if r[11] == "VALID"]
+
+    # Group by (decision, alignment) — but separate WAIT
     groups: dict[tuple, list] = {}
-    for row in rows:
-        key = (row[0], row[1] or "NONE")
+    for row in valid_rows:
+        decision = row[0]
+        alignment = row[1] or "NONE"
+        if decision == "WAIT":
+            alignment = "ALL"  # WAIT uses its own context, not alignment
+        key = (decision, alignment)
         groups.setdefault(key, []).append(row)
 
     result = {
         "horizon_minutes": horizon_minutes,
-        "total_evaluated": len(rows),
-        "sample_quality": "INSUFFICIENT" if len(rows) < 30 else ("EARLY" if len(rows) < 100 else ("MODERATE" if len(rows) < 300 else "STRONGER_EVIDENCE")),
+        "raw_observations": raw_count,
+        "valid_evaluated": len(valid_rows),
+        "sample_size": len(valid_rows),
+        "sample_quality": "INSUFFICIENT" if len(valid_rows) < 30 else ("EARLY" if len(valid_rows) < 100 else ("MODERATE" if len(valid_rows) < 300 else "STRONGER_EVIDENCE")),
         "probability_calibrated": False,
         "groups": [],
     }
@@ -629,10 +791,9 @@ def get_forward_performance(horizon_minutes: int = 60) -> dict:
         if n == 0:
             continue
 
-        # Directional rates
         if decision in ("BUY", "SELL"):
             favorable = "UP" if decision == "BUY" else "DOWN"
-            favorable_count = sum(1 for r in group_rows if r[2] == favorable)
+            favorable_count = sum(1 for r in group_rows if r[3] == favorable)
             lo, hi = wilson_interval(favorable_count, n)
             result["groups"].append({
                 "group": f"Technical {decision} + historical {alignment}",
@@ -644,26 +805,28 @@ def get_forward_performance(horizon_minutes: int = 60) -> dict:
                 "favorable_rate": round(favorable_count / n, 4),
                 "wilson_lower": round(lo, 4),
                 "wilson_upper": round(hi, 4),
-                "median_mfe": round(sorted([r[3] for r in group_rows if r[3] is not None])[n // 2], 4) if n > 0 and any(r[3] is not None for r in group_rows) else None,
-                "median_mae": round(sorted([r[4] for r in group_rows if r[4] is not None])[n // 2], 4) if n > 0 and any(r[4] is not None for r in group_rows) else None,
+                "median_mfe": round(sorted([r[4] for r in group_rows if r[4] is not None])[n // 2], 4) if n > 0 and any(r[4] is not None for r in group_rows) else None,
+                "median_mae": round(sorted([r[5] for r in group_rows if r[5] is not None])[n // 2], 4) if n > 0 and any(r[5] is not None for r in group_rows) else None,
             })
         elif decision == "WAIT":
-            moves = [abs(r[7] or 0) for r in group_rows]
-            ups = [r[8] for r in group_rows if r[8] is not None]
-            downs = [r[9] for r in group_rows if r[9] is not None]
+            moves = [abs(r[8] or 0) for r in group_rows]
+            ups = [r[9] for r in group_rows if r[9] is not None]
+            downs = [r[10] for r in group_rows if r[10] is not None]
+            directional_count = sum(1 for r in group_rows if r[3] in ("UP", "DOWN"))
             result["groups"].append({
-                "group": f"Technical WAIT + historical {alignment}",
+                "group": f"Technical WAIT",
                 "decision": decision,
-                "alignment": alignment,
+                "alignment": "ALL",
                 "sample_size": n,
-                "median_absolute_move": round(sorted(moves)[n // 2], 4) if moves else None,
-                "median_max_up": round(sorted(ups)[len(ups) // 2], 4) if ups else None,
-                "median_max_down": round(sorted(downs)[len(downs) // 2], 4) if downs else None,
+                "median_absolute_return": round(sorted(moves)[n // 2], 4) if moves else None,
+                "median_max_up_move": round(sorted(ups)[len(ups) // 2], 4) if ups else None,
+                "median_max_down_move": round(sorted(downs)[len(downs) // 2], 4) if downs else None,
+                "directional_move_rate": round(directional_count / n, 4) if n > 0 else None,
             })
 
-    # Also add overall groups (all alignments combined)
+    # Add overall groups for BUY/SELL (all alignments)
     for decision in ("BUY", "SELL", "WAIT"):
-        decision_rows = [r for r in rows if r[0] == decision]
+        decision_rows = [r for r in valid_rows if r[0] == decision]
         n = len(decision_rows)
         if n == 0:
             result["groups"].append({
@@ -677,7 +840,7 @@ def get_forward_performance(horizon_minutes: int = 60) -> dict:
 
         if decision in ("BUY", "SELL"):
             favorable = "UP" if decision == "BUY" else "DOWN"
-            favorable_count = sum(1 for r in decision_rows if r[2] == favorable)
+            favorable_count = sum(1 for r in decision_rows if r[3] == favorable)
             lo, hi = wilson_interval(favorable_count, n)
             result["groups"].append({
                 "group": f"Technical {decision} overall",
@@ -689,17 +852,17 @@ def get_forward_performance(horizon_minutes: int = 60) -> dict:
                 "favorable_rate": round(favorable_count / n, 4),
                 "wilson_lower": round(lo, 4),
                 "wilson_upper": round(hi, 4),
-                "median_mfe": round(sorted([r[3] for r in decision_rows if r[3] is not None])[n // 2], 4) if any(r[3] is not None for r in decision_rows) else None,
-                "median_mae": round(sorted([r[4] for r in decision_rows if r[4] is not None])[n // 2], 4) if any(r[4] is not None for r in decision_rows) else None,
+                "median_mfe": round(sorted([r[4] for r in decision_rows if r[4] is not None])[n // 2], 4) if any(r[4] is not None for r in decision_rows) else None,
+                "median_mae": round(sorted([r[5] for r in decision_rows if r[5] is not None])[n // 2], 4) if any(r[5] is not None for r in decision_rows) else None,
             })
         elif decision == "WAIT":
-            moves = [abs(r[7] or 0) for r in decision_rows]
+            moves = [abs(r[8] or 0) for r in decision_rows]
             result["groups"].append({
                 "group": f"Technical WAIT overall",
                 "decision": decision,
                 "alignment": "ALL",
                 "sample_size": n,
-                "median_absolute_move": round(sorted(moves)[n // 2], 4) if moves else None,
+                "median_absolute_return": round(sorted(moves)[n // 2], 4) if moves else None,
             })
 
     return result

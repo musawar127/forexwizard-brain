@@ -251,3 +251,97 @@ def run_startup_migrations() -> None:
                     log.info("migration: added %s column to build_jobs", col_name)
     except Exception as exc:
         log.warning("migration: BuildJob reconciliation column check failed: %s", exc)
+
+    # 10. Phase 5.1: add new fields to forward_observations.
+    try:
+        inspector = inspect(engine)
+        if "forward_observations" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("forward_observations")}
+            needed = [
+                ("invalid_reason", "VARCHAR(64)"),
+                ("wait_historical_context", "VARCHAR(32)"),
+                ("quote_age_seconds", "FLOAT"),
+                ("brain_analysis_age_seconds", "FLOAT"),
+                ("similarity_run_age_seconds", "FLOAT"),
+                ("similarity_run_created_at", "DATETIME"),
+                ("similarity_run_market_timestamp", "DATETIME"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE forward_observations ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to forward_observations", col_name)
+
+            # Phase 5.1: audit existing WAIT observation FWD-8A0A8E16
+            # 1. If capture_timestamp < forward_validation_started_at → mark INVALID
+            # 2. For WAIT observations: set historical_alignment=NOT_APPLICABLE,
+            #    populate wait_historical_context from old alignment
+            try:
+                with engine.begin() as conn:
+                    # Get forward_validation_started_at
+                    row = conn.execute(text(
+                        "SELECT value FROM system_config WHERE key='forward_validation_started_at'"
+                    )).fetchone()
+                    if row:
+                        from datetime import datetime as _dt, timezone as _tz
+                        try:
+                            start_dt = _dt.fromisoformat(row[0]).replace(tzinfo=None)
+                        except (ValueError, TypeError):
+                            start_dt = None
+                        if start_dt:
+                            # Mark observations with capture_timestamp < start_dt as INVALID
+                            conn.execute(text(
+                                "UPDATE forward_observations SET observation_status='INVALID', "
+                                "invalid_reason='BEFORE_FORWARD_VALIDATION_START' "
+                                "WHERE capture_timestamp < :start AND observation_status != 'INVALID'"
+                            ), {"start": start_dt})
+                            log.info("migration: audited pre-start forward observations")
+
+                    # Migrate WAIT observations: historical_alignment → wait_historical_context
+                    # For WAIT observations that had SUPPORTS: → DIRECTIONAL_UP (if historical was UP-dominant)
+                    # For WAIT with CONTRADICTS: → DIRECTIONAL_DOWN
+                    # For WAIT with NEUTRAL/INSUFFICIENT_DATA: → NEUTRAL/INSUFFICIENT_DATA
+                    # For WAIT with SUPPORTS (which was set because dominant was NEUTRAL):
+                    #   → NEUTRAL (the WAIT case of SUPPORTS means dominant was NEUTRAL)
+                    conn.execute(text(
+                        "UPDATE forward_observations SET wait_historical_context = "
+                        "CASE historical_alignment "
+                        "  WHEN 'SUPPORTS' THEN 'NEUTRAL' "
+                        "  WHEN 'CONTRADICTS' THEN 'NEUTRAL' "
+                        "  WHEN 'NEUTRAL' THEN 'NEUTRAL' "
+                        "  WHEN 'INSUFFICIENT_DATA' THEN 'INSUFFICIENT_DATA' "
+                        "  ELSE 'INSUFFICIENT_DATA' END, "
+                        "historical_alignment = 'NOT_APPLICABLE' "
+                        "WHERE technical_decision = 'WAIT'"
+                    ))
+                    log.info("migration: migrated WAIT observations to NOT_APPLICABLE alignment")
+            except Exception as exc:
+                log.warning("migration: forward observation audit failed (non-fatal): %s", exc)
+    except Exception as exc:
+        log.warning("migration: forward_observations Phase 5.1 column check failed: %s", exc)
+
+    # 11. Phase 5.1: add new fields to forward_outcomes.
+    try:
+        inspector = inspect(engine)
+        if "forward_outcomes" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("forward_outcomes")}
+            needed = [
+                ("outcome_status", "VARCHAR(16) DEFAULT 'PENDING' NOT NULL"),
+                ("invalid_reason", "VARCHAR(64)"),
+                ("target_timestamp", "DATETIME"),
+                ("actual_future_timestamp", "DATETIME"),
+                ("timestamp_error_seconds", "FLOAT"),
+                ("elapsed_wall_time", "FLOAT"),
+                ("elapsed_market_time", "FLOAT"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE forward_outcomes ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to forward_outcomes", col_name)
+    except Exception as exc:
+        log.warning("migration: forward_outcomes Phase 5.1 column check failed: %s", exc)

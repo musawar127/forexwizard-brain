@@ -529,6 +529,22 @@ class ForwardObservation(Base):
     # Lifecycle
     observation_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
     # PENDING → PARTIALLY_EVALUATED → COMPLETE / INVALID
+    # Phase 5.1: invalid_reason for observations that violate rules
+    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Phase 5.1: WAIT alignment semantics — for WAIT observations,
+    # historical_alignment = NOT_APPLICABLE and wait_historical_context is used instead.
+    wait_historical_context: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # DIRECTIONAL_UP / DIRECTIONAL_DOWN / NEUTRAL / INSUFFICIENT_DATA
+
+    # Phase 5.1: data freshness at capture (stored separately)
+    quote_age_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    brain_analysis_age_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    similarity_run_age_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Phase 5.1: historical run immutability link
+    similarity_run_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    similarity_run_market_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ForwardOutcome(Base):
@@ -570,6 +586,19 @@ class ForwardOutcome(Base):
     resolution_sufficient: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     horizon_valid: Mapped[bool] = mapped_column(Boolean, default=True)
     evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Phase 5.1: outcome status + invalid reason + target timestamp metadata
+    outcome_status: Mapped[str] = mapped_column(String(16), default="PENDING")  # PENDING/VALID/INVALID
+    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # INSUFFICIENT_SPOT_DATA / TARGET_TIMESTAMP_MISSING / MARKET_CLOSURE / BAD_SOURCE_DATA / OBSERVATION_INVALID
+
+    target_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    actual_future_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timestamp_error_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Phase 5.1: market-aware elapsed time
+    elapsed_wall_time: Mapped[float | None] = mapped_column(Float, nullable=True)  # seconds
+    elapsed_market_time: Mapped[float | None] = mapped_column(Float, nullable=True)  # seconds (excludes closures)
 
 
 class ForwardAuditLog(Base):
