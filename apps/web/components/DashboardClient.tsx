@@ -85,6 +85,29 @@ export function DashboardClient() {
           <div><h3>For</h3>{brain?.reasons_for?.length ? brain.reasons_for.slice(0,5).map((x)=><p key={x} className="evidence good-e">✓ {x}</p>) : <p className="muted">No strong directional evidence yet.</p>}</div>
           <div><h3>Against</h3>{brain?.reasons_against?.length ? brain.reasons_against.slice(0,5).map((x)=><p key={x} className="evidence warn-e">• {x}</p>) : <p className="muted">No major contradiction recorded.</p>}</div>
         </div>
+        {/* Phase 3.2: separate read-only context strip — does NOT influence
+            the BUY/SELL/WAIT decision. Just exposes what's behind the
+            technical_score number so it's not mistaken for a probability. */}
+        <div className="context-strip">
+          <div>
+            <small>Technical data readiness</small>
+            <strong>{brain ? `${brain.technical_data_readiness?.toFixed(0) ?? brain.readiness.toFixed(0)}%` : "—"}</strong>
+          </div>
+          <div>
+            <small>Instrument consistency</small>
+            <strong style={{ color: brain?.instrument_consistency === "MIXED" ? "var(--amber)" : brain?.instrument_consistency === "PURE_GC" ? "var(--green)" : brain?.instrument_consistency === "PURE_SPOT" ? "var(--blue)" : "var(--muted)" }}>
+              {brain?.instrument_consistency || "—"}
+            </strong>
+          </div>
+          <div>
+            <small>H1 historical depth</small>
+            <strong>{brain?.historical_depth?.["1h"] != null ? `${brain.historical_depth["1h"].toFixed(1)}d` : "—"}</strong>
+          </div>
+          <div>
+            <small>D1 historical depth</small>
+            <strong>{brain?.historical_depth?.["1day"] != null ? `${brain.historical_depth["1day"].toFixed(0)}d` : "—"}</strong>
+          </div>
+        </div>
       </section>
     </section>
 

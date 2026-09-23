@@ -355,3 +355,147 @@ Not implemented (as required):
 Stage Summary:
 - Phase 3.1 complete. 30,844 genuine historical candles (3.66x Phase 3's 8,435) with full source lineage. Each TF now uses Yahoo's native interval directly (M5/M15/M30 went from 5d derived to 30d direct; H1 went from 5d derived to 2y direct). H4 is the only derived TF (from H1). Brain BUY/SELL/WAIT logic unchanged but now reports historical_depth + instrument_consistency + technical_data_readiness as separate read-only context fields. New /data page renders 12-column per-lineage table + separate interval-quality table. 43 tests pass. Build clean.
 - Phase 4 NOT started.
+
+---
+Task ID: 6 (Phase 3.2)
+Agent: main
+Task: Data quality + confidence semantics. Classify gaps, rename confidence → technical_score, expose nullable statistical fields for Phase 4, MIXED instrument notice.
+
+Work Log:
+
+Backend code modified (6 files):
+  apps/api/app/services/historical/validator.py
+    — REWROTE gap classification logic. Each detected gap is now classified into:
+      EXPECTED_MARKET_CLOSURE (Saturday UTC, Sunday UTC before 22:00, CME-observed US federal holiday, Friday after 21:00 UTC)
+      EXPECTED_SESSION_BREAK (Mon-Thu 21:00 UTC = daily CME maintenance 17:00-18:00 ET)
+      UNEXPECTED_GAP (any other missing period — genuine data loss)
+      INVALID_DATA (placeholder, not produced by find_gaps() — invalidity is a CandleValidationReport concern)
+    — Added _CME_HOLIDAYS set covering 2024-2027 (New Year, MLK, Washington's Birthday, Good Friday, Memorial Day, Juneteenth, Independence Day, Labor Day, Thanksgiving, Christmas).
+    — GapReport now exposes expected_gap_count, unexpected_gap_count, invalid_candle_count, expected_market_closures[], expected_session_breaks[], unexpected_gaps[], invalid_data_gaps[].
+    — GapReport.integrity_status uses new semantics: HEALTHY (only expected gaps), DEGRADED (any unexpected gap). INVALID is never set here — see CandleValidationReport.
+    — CandleValidationReport.integrity_status uses new semantics: HEALTHY (clean batch), DEGRADED (duplicates only), INVALID (invalid OHLC / out-of-order / zero-negative prices), EMPTY.
+    — Added invalid_candle_count property on CandleValidationReport = invalid_ohlc + zero_or_negative_price.
+
+  apps/api/app/models/market.py
+    — Extended BrainAnalysis with:
+      technical_score: float | None — SAME value as confidence, renamed for display.
+      historical_sample_size, historical_direction_rate, historical_mfe, historical_mae, historical_probability: float | None — all NULL until Phase 4.
+      probability_calibrated: bool | None — NULL until Phase 4.
+
+  apps/api/app/engine/analysis.py
+    — Added DEPTH_TIMEFRAMES = TIMEFRAMES + ["1day"] so the dashboard can show D1 historical depth.
+    — Both return paths (NO_DECISION early return + main return) now populate:
+      technical_score = round(confidence, 1) (same value, different display name)
+      historical_sample_size = None
+      historical_direction_rate = None
+      historical_mfe = None
+      historical_mae = None
+      historical_probability = None
+      probability_calibrated = None
+    — historical_depth dict now includes "1day" key for the dashboard context-strip.
+    — SCORING LOGIC UNCHANGED — 0 lines of BUY/SELL/WAIT rules modified. The
+      technical_score value is computed by the SAME formula as confidence.
+
+  apps/api/app/services/historical/data_quality.py
+    — interval_quality per-TF dict now exposes:
+      expected_gap_count, unexpected_gap_count, invalid_candle_count (Phase 3.2)
+      missing_intervals, expected_periods, completeness_pct, duplicate_count (backward-compat)
+      integrity_status now uses HEALTHY/DEGRADED/INVALID semantics
+      instrument_consistency, historical_depth_days (Phase 3.1)
+    — timeframe_breakdown rows now include invalid_candle_count and use new HEALTHY/DEGRADED/INVALID.
+    — Added _count_invalid_candles(symbol, interval) helper — counts DB rows with NULL OHLC, zero/negative prices, or inconsistent high<low etc.
+
+Frontend code modified (4 files):
+  apps/web/lib/types.ts
+    — BrainAnalysis type extended with technical_score + 6 nullable statistical fields.
+    — IntervalQuality type extended with expected_gap_count, unexpected_gap_count, invalid_candle_count.
+    — TimeframeRow type extended with invalid_candle_count.
+
+  apps/web/components/DecisionCard.tsx
+    — Display label changed from "Confidence" → "Technical score"
+    — Value display changed from "92%" → "92.0 / 100" (NOT a probability).
+    — Added MIXED instrument-consistency notice (amber-bordered box) when brain.instrument_consistency === "MIXED".
+    — Added "Statistical probability: not yet calculated (Phase 4)" pending notice when brain.historical_probability == null.
+
+  apps/web/components/DashboardClient.tsx
+    — Added context-strip panel below the Evidence columns showing:
+      Technical data readiness | Instrument consistency | H1 historical depth | D1 historical depth
+      (all read-only context, does NOT influence BUY/SELL/WAIT)
+
+  apps/web/app/data/page.tsx
+    — Interval Quality table now shows: TF, Historical Depth, Instrument Consistency, Expected Gaps, Unexpected Gaps, Invalid Candles, Dup, Completeness, Integrity.
+    — Integrity badge color-coded: HEALTHY=green, DEGRADED=amber, INVALID=red.
+    — Added full Phase 3.2 gap classification explainer paragraph below the table.
+    — Added MIXED instrument-consistency notice (amber-bordered panel) that appears when any TF has instrument_consistency === "MIXED".
+
+  apps/web/app/globals.css
+    — Added .context-strip, .mixed-instrument-notice, .prob-pending-notice CSS classes.
+
+Tests added (1 new file):
+  apps/api/tests/test_phase32_data_quality.py — 18 tests:
+    7 single-timestamp classifier tests (Saturday, Sunday morning, Sunday after 22:00, CME holidays, weekday session break, Friday after 21:00, unexpected weekday gap)
+    3 find_gaps() end-to-end tests (weekend closures HEALTHY, weekday gap DEGRADED, session-break-only HEALTHY, invalid_data_gaps always empty)
+    5 CandleValidationReport integrity tests (HEALTHY clean batch, INVALID on bad OHLC, INVALID on zero price, DEGRADED on duplicates, EMPTY on empty input)
+    2 BrainAnalysis tests (technical_score == confidence, all 6 statistical fields null until Phase 4)
+    1 historical_depth test (already in test_historical_lineage.py from Phase 3.1)
+
+Tests updated (1 file):
+  apps/api/tests/test_historical_validation.py
+    — test_validate_clean_batch_passes: integrity_status expected "OK" → "HEALTHY"
+    — test_validate_rejects_high_below_low: integrity_status expected "DEGRADED" → "INVALID"
+
+Tests run: 61 passed (was 43 in Phase 3.1 — net +18 tests)
+Typecheck: 0 errors
+Next build: success — 8 routes prerendered
+
+Brain snapshot verification (Phase 3.2):
+  decision: SELL
+  confidence: 92.0 (unchanged from Phase 3.1 — calculation NOT modified)
+  technical_score: 92.0 (== confidence — renamed for display only)
+  historical_sample_size: None ✓ (Phase 4)
+  historical_probability: None ✓ (Phase 4)
+  probability_calibrated: None ✓ (Phase 4)
+  instrument_consistency: MIXED
+  historical_depth: {4h:730d, 1h:730d, 30min:30.76d, 15min:30.76d, 5min:30.75d, 1min:5.51d, 1day:3652d}
+
+/api/data/status interval_quality verification (Phase 3.2 classified gap counts):
+  M1:   expected=3060  unexpected=14   invalid=0  → DEGRADED  (14 genuine data losses, 3060 weekend closures)
+  M5:   expected=2807  unexpected=78   invalid=0  → DEGRADED
+  M15:  expected=947   unexpected=24   invalid=0  → DEGRADED
+  M30:  expected=473   unexpected=13   invalid=0  → DEGRADED
+  H1:   expected=2561  unexpected=181  invalid=0  → DEGRADED
+  H4:   expected=1242  unexpected=35   invalid=0  → DEGRADED
+  D1:   expected=1072  unexpected=99   invalid=0  → DEGRADED
+
+  All show DEGRADED because Yahoo's data has some genuine weekday data losses.
+  Before Phase 3.2, ALL ~3000 missing intervals at M1 were lumped together as
+  "DEGRADED" — now the user can see that 3060/3074 = 99.5% are expected weekend
+  closures, and only 14 are genuine data losses.
+
+Browser test results:
+  /data page (screenshot phase32-01-data.png):
+    - Per-lineage integrity table: all 7 TFs show HEALTHY (no corruption, no dups)
+    - Interval Quality table: shows Expected Gaps, Unexpected Gaps, Invalid Candles columns separately
+    - Phase 3.2 gap classification explainer paragraph visible
+    - No MIXED notice on /data (all historical candles are PURE_GC at this TF level)
+  Dashboard (screenshot phase32-03-dashboard-final.png):
+    - DecisionCard: "Technical score | 92.0 / 100" (NOT "Confidence 92%")
+    - MIXED instrument notice: "Live spot and futures historical context are both present. Historical futures observations are treated as a separate instrument — statistics are not combined."
+    - Prob-pending notice: "Statistical probability: not yet calculated (Phase 4)"
+    - Context strip: "Technical data readiness 100% | Instrument consistency MIXED | H1 historical depth 730.0d | D1 historical depth 3652d"
+
+Preserved (as required):
+  - BUY/SELL/WAIT rules-v0.1 logic — UNCHANGED, 0 lines of scoring code modified
+  - confidence field preserved in API response (backward compat) — technical_score is an alias, not a replacement
+  - No real-money trading
+  - No fake candles or synthetic history
+  - Missing candles NOT silently filled — only classified + reported
+
+Not implemented (as required):
+  - No historical pattern learning (statistical fields remain NULL until Phase 4)
+  - No strategy optimization
+  - No BUY/SELL/WAIT logic modifications based on historical statistics
+
+Stage Summary:
+- Phase 3.2 complete. Gap classification now distinguishes EXPECTED_MARKET_CLOSURE / EXPECTED_SESSION_BREAK / UNEXPECTED_GAP / INVALID_DATA. Integrity uses HEALTHY/DEGRADED/INVALID semantics. confidence renamed to technical_score for display (calculation unchanged, backward-compat preserved). 6 nullable statistical fields exposed for Phase 4. MIXED instrument-consistency notice shown on both /data page and dashboard. 61 tests pass. Build clean.
+- Phase 4 NOT started.

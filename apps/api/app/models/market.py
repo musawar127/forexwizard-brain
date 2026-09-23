@@ -84,6 +84,25 @@ class BrainAnalysis(BaseModel):
     historical_depth: dict[str, float] = Field(default_factory=dict)
     instrument_consistency: str = "NONE"  # PURE_GC | PURE_SPOT | MIXED | NONE
     technical_data_readiness: float = 0.0
+    # Phase 3.2: rename-display semantics. The existing rules-v0.1
+    # `confidence` value is NOT a calibrated probability — it's a
+    # deterministic rule-agreement score. We expose the SAME value as
+    # `technical_score` so the frontend can display "Technical score:
+    # 91.9 / 100" instead of "91.9% probability of success". The
+    # underlying calculation is unchanged. Backward compat: `confidence`
+    # is preserved in API responses.
+    technical_score: float | None = None
+    # Phase 3.2: future statistical-probability fields. These remain
+    # NULL until Phase 4 implements historical pattern learning. They
+    # are exposed in the API so the frontend can render placeholders
+    # ("Not yet calculated — Phase 4") today and real numbers later
+    # without breaking the response schema.
+    historical_sample_size: int | None = None
+    historical_direction_rate: float | None = None
+    historical_mfe: float | None = None
+    historical_mae: float | None = None
+    historical_probability: float | None = None
+    probability_calibrated: bool | None = None
 
 
 class AskRequest(BaseModel):

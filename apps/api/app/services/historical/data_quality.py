@@ -184,13 +184,28 @@ async def data_quality_summary(symbol: str = "XAU/USD") -> dict:
         gap_report = find_gaps(historical_only, interval)
         consistency = _instrument_consistency(historical_only)
         depth = _historical_depth_for_tf(symbol, interval)
+        dup_count = _count_db_duplicates(interval, symbol)
+        # Phase 3.2: classify gaps into EXPECTED_MARKET_CLOSURE,
+        # EXPECTED_SESSION_BREAK, UNEXPECTED_GAP. Integrity is HEALTHY
+        # when only expected closures exist; DEGRADED when unexpected
+        # gaps exist; INVALID when invalid OHLC / out-of-order / dup
+        # corruption exists.
+        if dup_count > 0:
+            integrity = "DEGRADED"
+        else:
+            integrity = gap_report.integrity_status  # HEALTHY or DEGRADED
         interval_quality[interval] = {
             "interval": interval,
+            # Phase 3.2: classified gap counts (separate)
+            "expected_gap_count": gap_report.expected_gap_count,
+            "unexpected_gap_count": gap_report.unexpected_gap_count,
+            "invalid_candle_count": _count_invalid_candles(symbol, interval),
+            # Backward-compat aggregate (still useful as a total)
             "missing_intervals": gap_report.missing_periods,
             "expected_periods": gap_report.expected_periods,
             "completeness_pct": gap_report.completeness_pct,
-            "duplicate_count": _count_db_duplicates(interval, symbol),
-            "integrity_status": "OK" if (gap_report.missing_periods == 0 and _count_db_duplicates(interval, symbol) == 0) else "DEGRADED",
+            "duplicate_count": dup_count,
+            "integrity_status": integrity,
             "instrument_consistency": consistency,
             "historical_depth_days": depth,
         }
@@ -287,6 +302,15 @@ def timeframe_breakdown(symbol: str = "XAU/USD") -> list[dict]:
                 )
             ).all()
             for provider, derivation, instrument, provider_symbol, source_tf, target_tf, count, first, last in rows:
+                dup = _count_db_duplicates(interval, symbol)
+                invalid = _count_invalid_candles(symbol, interval)
+                # Phase 3.2: HEALTHY / DEGRADED / INVALID semantics.
+                if invalid > 0:
+                    integrity = "INVALID"
+                elif dup > 0:
+                    integrity = "DEGRADED"
+                else:
+                    integrity = "HEALTHY"
                 out.append({
                     "interval": interval,
                     "provider": provider,
@@ -299,10 +323,40 @@ def timeframe_breakdown(symbol: str = "XAU/USD") -> list[dict]:
                     "first_timestamp": _to_iso_naive(first),
                     "last_timestamp": _to_iso_naive(last),
                     "days_covered": _days_between(first, last),
-                    "duplicate_count": _count_db_duplicates(interval, symbol),
-                    "integrity_status": "OK" if _count_db_duplicates(interval, symbol) == 0 else "DEGRADED",
+                    "duplicate_count": dup,
+                    "invalid_candle_count": invalid,
+                    "integrity_status": integrity,
                 })
     return out
+
+
+def _count_invalid_candles(symbol: str, interval: str) -> int:
+    """Phase 3.2: count candles with invalid OHLC persisted in the DB.
+
+    A candle is "invalid" if:
+      - any OHLC field is null
+      - any OHLC field is zero or negative
+      - high < low, or high < max(open, close), or low > min(open, close)
+    The validator should have rejected these on insert, but this query
+    is a defense-in-depth check for the /data page integrity badge.
+    """
+    with SessionLocal() as session:
+        from sqlalchemy import text
+        result = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM market_candles
+                WHERE symbol = :sym AND interval = :iv AND is_historical = 1
+                  AND (open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
+                       OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
+                       OR high < low
+                       OR high < max(open, close)
+                       OR low > min(open, close))
+                """
+            ),
+            {"sym": symbol, "iv": interval},
+        )
+        return int(result.scalar() or 0)
 
 
 def _count_db_duplicates(interval: str, symbol: str) -> int:

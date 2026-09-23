@@ -52,6 +52,20 @@ export type BrainAnalysis = {
   historical_depth?: Record<string, number>;
   instrument_consistency?: string;
   technical_data_readiness?: number;
+  // Phase 3.2: technical_score is the SAME value as confidence, renamed
+  // for display so it's not mistaken for a calibrated probability.
+  // Display this as "Technical score: X / 100" — NOT "X% probability".
+  technical_score?: number | null;
+  // Phase 3.2: future statistical-probability fields — all NULL until
+  // Phase 4 implements historical pattern learning. Frontend renders
+  // placeholders for these today; real numbers come later without a
+  // breaking schema change.
+  historical_sample_size?: number | null;
+  historical_direction_rate?: number | null;
+  historical_mfe?: number | null;          // maximum favorable excursion
+  historical_mae?: number | null;          // maximum adverse excursion
+  historical_probability?: number | null;
+  probability_calibrated?: boolean | null;
 };
 
 export type Snapshot = {
@@ -128,6 +142,10 @@ export type IntervalQuality = {
   integrity_status: string;
   instrument_consistency: string;  // PURE_GC | PURE_SPOT | MIXED | NONE
   historical_depth_days: number;
+  // Phase 3.2: classified gap counts (separate)
+  expected_gap_count?: number;
+  unexpected_gap_count?: number;
+  invalid_candle_count?: number;
 };
 
 export type SyncStateRow = {
@@ -180,7 +198,8 @@ export type TimeframeRow = {
   last_timestamp: string | null;
   days_covered: number | null;
   duplicate_count: number;
-  integrity_status: string;
+  invalid_candle_count?: number;   // Phase 3.2
+  integrity_status: string;        // Phase 3.2: HEALTHY | DEGRADED | INVALID
 };
 
 export type GapReport = {

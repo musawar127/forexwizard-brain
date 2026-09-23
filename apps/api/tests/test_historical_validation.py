@@ -40,7 +40,8 @@ def test_validate_clean_batch_passes():
     assert report.out_of_order == 0
     assert report.zero_or_negative_price == 0
     assert len(report.valid_candles) == 10
-    assert report.integrity_status == "OK"
+    # Phase 3.2: integrity_status renamed OK → HEALTHY
+    assert report.integrity_status == "HEALTHY"
 
 
 def test_validate_rejects_high_below_low():
@@ -49,7 +50,8 @@ def test_validate_rejects_high_below_low():
     report = validate_candles([bad])
     assert report.invalid_ohlc == 1
     assert len(report.valid_candles) == 0
-    assert report.integrity_status == "DEGRADED"
+    # Phase 3.2: invalid OHLC → integrity_status = INVALID (was DEGRADED)
+    assert report.integrity_status == "INVALID"
 
 
 def test_validate_rejects_zero_and_negative_prices():

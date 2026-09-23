@@ -14,6 +14,11 @@ from app.models.market import BrainAnalysis, Candle, TimeframeState, Zone
 
 TIMEFRAMES = ["4h", "1h", "30min", "15min", "5min", "1min"]
 
+# Phase 3.2: also compute historical_depth for D1 — the dashboard's
+# context-strip shows H1 + D1 depth so the user knows what genuine
+# history backs the technical_score at a glance.
+DEPTH_TIMEFRAMES = TIMEFRAMES + ["1day"]
+
 
 def _full_historical_depth_days(symbol: str, interval: str) -> float:
     """Query HistoricalSyncState for the FULL earliest/latest historical
@@ -151,6 +156,11 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         historical_depth[tf] = _full_historical_depth_days("XAU/USD", tf)
         instrument_per_tf[tf] = {getattr(c, "instrument", "XAUUSD_SPOT") for c in candles}
 
+    # Phase 3.2: also compute D1 depth (the dashboard context-strip uses it).
+    # D1 is NOT in TIMEFRAMES because the Brain's trend logic doesn't read
+    # D1 for its scoring — but the depth info is still useful read-only context.
+    historical_depth["1day"] = _full_historical_depth_days("XAU/USD", "1day")
+
     ready = [x for x in timeframe_states if x.status == "READY" and x.trend != "INSUFFICIENT_DATA"]
     readiness = min(100.0, round(len(ready) / 4 * 100, 1))
 
@@ -188,6 +198,13 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
             historical_depth=historical_depth,
             instrument_consistency=instrument_consistency,
             technical_data_readiness=readiness,
+            technical_score=0.0,
+            historical_sample_size=None,
+            historical_direction_rate=None,
+            historical_mfe=None,
+            historical_mae=None,
+            historical_probability=None,
+            probability_calibrated=None,
         )
 
     # Select the richest locally accumulated timeframe for nearby zones.
@@ -298,4 +315,17 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         historical_depth=historical_depth,
         instrument_consistency=instrument_consistency,
         technical_data_readiness=readiness,
+        # Phase 3.2: technical_score is the SAME value as confidence —
+        # renamed for display so it's not mistaken for a probability.
+        technical_score=round(confidence, 1),
+        # Phase 3.2: statistical-probability fields remain NULL until
+        # Phase 4 implements historical pattern learning. They are
+        # exposed in the API so the frontend can render placeholders
+        # today without breaking the response schema.
+        historical_sample_size=None,
+        historical_direction_rate=None,
+        historical_mfe=None,
+        historical_mae=None,
+        historical_probability=None,
+        probability_calibrated=None,
     )

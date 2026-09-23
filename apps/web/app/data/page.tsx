@@ -301,7 +301,7 @@ export default function DataPage() {
         <div className="panel-head">
           <div>
             <div className="panel-kicker">INTERVAL QUALITY</div>
-            <h2>Historical depth + instrument consistency per TF</h2>
+            <h2>Historical depth + instrument consistency + gap classification per TF</h2>
           </div>
         </div>
         <div className="table-wrap">
@@ -311,54 +311,105 @@ export default function DataPage() {
                 <th>TF</th>
                 <th>Historical Depth</th>
                 <th>Instrument Consistency</th>
-                <th>Missing</th>
-                <th>Expected</th>
-                <th>Completeness</th>
+                <th>Expected Gaps</th>
+                <th>Unexpected Gaps</th>
+                <th>Invalid Candles</th>
                 <th>Dup</th>
+                <th>Completeness</th>
                 <th>Integrity</th>
               </tr>
             </thead>
             <tbody>
-              {Object.entries(intervalQuality).map(([tf, q]) => (
-                <tr key={tf}>
-                  <td><strong>{prettyTf(tf)}</strong></td>
-                  <td><strong style={{ color: "var(--gold)" }}>{fmtDays(q.historical_depth_days)}</strong></td>
-                  <td>
-                    <span style={{
-                      color: CONSISTENCY_COLOR[q.instrument_consistency] || "var(--muted)",
-                      fontWeight: 700,
-                      fontSize: "10px",
-                    }}>
-                      {q.instrument_consistency}
-                    </span>
-                  </td>
-                  <td>{q.missing_intervals}</td>
-                  <td>{q.expected_periods}</td>
-                  <td>{q.completeness_pct ? `${q.completeness_pct}%` : "—"}</td>
-                  <td>{q.duplicate_count}</td>
-                  <td>
-                    <span style={{
-                      color: q.integrity_status === "OK" ? "var(--green)" : "var(--amber)",
-                      background: q.integrity_status === "OK" ? "rgba(46,211,154,.08)" : "rgba(242,184,75,.08)",
-                      padding: "4px 7px",
-                      borderRadius: "999px",
-                      fontSize: "8px",
-                      fontWeight: 800,
-                    }}>
-                      {q.integrity_status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {Object.entries(intervalQuality).map(([tf, q]) => {
+                const integrity = q.integrity_status || "HEALTHY";
+                const integrityColor =
+                  integrity === "HEALTHY" ? "var(--green)" :
+                  integrity === "DEGRADED" ? "var(--amber)" :
+                  integrity === "INVALID" ? "var(--red)" : "var(--muted)";
+                const integrityBg =
+                  integrity === "HEALTHY" ? "rgba(46,211,154,.08)" :
+                  integrity === "DEGRADED" ? "rgba(242,184,75,.08)" :
+                  integrity === "INVALID" ? "rgba(255,107,122,.08)" : "#1a222d";
+                return (
+                  <tr key={tf}>
+                    <td><strong>{prettyTf(tf)}</strong></td>
+                    <td><strong style={{ color: "var(--gold)" }}>{fmtDays(q.historical_depth_days)}</strong></td>
+                    <td>
+                      <span style={{
+                        color: CONSISTENCY_COLOR[q.instrument_consistency] || "var(--muted)",
+                        fontWeight: 700,
+                        fontSize: "10px",
+                      }}>
+                        {q.instrument_consistency}
+                      </span>
+                    </td>
+                    <td>
+                      <span style={{ color: "var(--muted)" }}>
+                        {q.expected_gap_count ?? 0}
+                      </span>
+                    </td>
+                    <td>
+                      <span style={{
+                        color: (q.unexpected_gap_count ?? 0) > 0 ? "var(--amber)" : "var(--green)",
+                        fontWeight: 700,
+                      }}>
+                        {q.unexpected_gap_count ?? 0}
+                      </span>
+                    </td>
+                    <td>
+                      <span style={{
+                        color: (q.invalid_candle_count ?? 0) > 0 ? "var(--red)" : "var(--green)",
+                        fontWeight: 700,
+                      }}>
+                        {q.invalid_candle_count ?? 0}
+                      </span>
+                    </td>
+                    <td>{q.duplicate_count}</td>
+                    <td>{q.completeness_pct ? `${q.completeness_pct}%` : "—"}</td>
+                    <td>
+                      <span style={{
+                        color: integrityColor,
+                        background: integrityBg,
+                        padding: "4px 7px",
+                        borderRadius: "999px",
+                        fontSize: "8px",
+                        fontWeight: 800,
+                      }}>
+                        {integrity}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
         <p className="muted" style={{ fontSize: "9px", marginTop: "8px", lineHeight: 1.5 }}>
-          Missing intervals are real market closures (weekends/holidays) — detected but NOT silently repaired.
-          Historical depth is the full DB range from HistoricalSyncState, not just the 120 most recent candles the Brain reads.
-          Instrument consistency MIXED means both GC_FRONT_MONTH (Yahoo futures) and XAUUSD_SPOT (Gold API spot) candles exist at this TF — never merged.
+          Phase 3.2 gap classification: <strong>EXPECTED_MARKET_CLOSURE</strong> = weekend or CME-observed US holiday.
+          {" "}<strong>EXPECTED_SESSION_BREAK</strong> = daily 1-hour CME maintenance window (Mon-Thu 17:00-18:00 ET).
+          {" "}<strong>UNEXPECTED_GAP</strong> = any other missing period — likely genuine data loss.
+          {" "}<strong>INVALID_DATA</strong> = OHLC corruption (high&lt;low, zero/negative prices, NaN/inf).
+          {" "}Integrity is <strong>HEALTHY</strong> if only expected closures exist, <strong>DEGRADED</strong> if unexpected gaps exist, <strong>INVALID</strong> if corruption exists.
+          {" "}Missing candles are <strong>NOT silently filled</strong> — only classified + reported.
         </p>
       </section>
+
+      {Object.values(intervalQuality).some(q => q.instrument_consistency === "MIXED") && (
+        <section className="panel" style={{
+          marginTop: "12px",
+          border: "1px solid rgba(242,184,75,.32)",
+          background: "rgba(242,184,75,.06)",
+        }}>
+          <div className="panel-kicker" style={{ color: "var(--amber)" }}>INSTRUMENT MIXED NOTICE</div>
+          <h2 style={{ color: "var(--amber)", marginTop: "4px" }}>Live spot and futures historical context are both present</h2>
+          <p style={{ fontSize: "11px", color: "#c8b888", lineHeight: 1.55, marginTop: "8px" }}>
+            The Brain detects both <strong>XAUUSD_SPOT</strong> (live Gold API spot, sampled every 30s) and
+            {" "}<strong>GC_FRONT_MONTH</strong> (Yahoo Finance gold futures, historical backfill) at one or more timeframes.
+            {" "}Historical futures observations are treated as a separate instrument — statistics are <strong>NOT combined</strong>.
+            {" "}Phase 4 statistical learning will respect this separation when computing historical probabilities.
+          </p>
+        </section>
+      )}
 
       <section className="two-col" style={{ marginTop: "12px" }}>
         <div className="panel">
