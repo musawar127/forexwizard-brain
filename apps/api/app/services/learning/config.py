@@ -98,8 +98,11 @@ class LearningConfig:
     # between state timestamp and the last candle in the forward window
     # exceeds expected_elapsed * max_elapsed_multiple, mark horizon_valid=False.
     max_elapsed_multiple: float = 2.0  # 2x expected — covers small closures, rejects weekends
-    # Phase 4.1: build batching — commit every N states.
-    build_batch_size: int = 25
+    # Phase 4.2: build batching — commit every N states.
+    # Set to 1 so the SQLite write lock is held for only ~16ms per state,
+    # well under the 5s busy_timeout. This allows the main event loop's
+    # collector_loop writes to interleave with the build's writes.
+    build_batch_size: int = 1
     # Phase 4.1: build checkpoint interval — update job progress every N states.
     build_checkpoint_interval: int = 50
 

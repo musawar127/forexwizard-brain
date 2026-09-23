@@ -114,18 +114,19 @@ def start_build_job(
         if clear_existing:
             _clear_existing_states(instrument)
 
-    # Phase 4.2: spawn the build in a THREAD POOL so its synchronous DB
-    # operations do NOT block the asyncio event loop. The API stays
-    # responsive even during heavy 11k-state writes.
-    # NOTE: the caller (an async FastAPI handler) must call this with
-    # the running event loop. We use asyncio.get_running_loop() which
-    # only works from within an async context.
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(None, _run_build_job_sync, job_id, instrument, base_timeframe, cfg)
-    _BUILD_TASKS[job_id] = task
+    # Phase 4.2: spawn the build in a DEDICATED daemon thread so its
+    # synchronous DB operations don't block the asyncio event loop AND
+    # don't compete with uvicorn's shared thread pool. WAL mode +
+    # busy_timeout (configured in session.py) keep reads responsive.
+    import threading
+    thread = threading.Thread(
+        target=_run_build_job_sync,
+        args=(job_id, instrument, base_timeframe, cfg),
+        daemon=True,
+        name=f"build-{job_id}",
+    )
+    thread.start()
+    _BUILD_TASKS[job_id] = thread  # type: ignore
     return {"job_id": job_id, "status": "running", "eligible_total": eligible_total}
 
 
@@ -214,6 +215,23 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
         d1_instrument = [c for c in all_d1_raw if getattr(c, "instrument", "") == instrument]
         h1_ts_sorted = [c.timestamp for c in h1_instrument]
 
+        # Phase 4.2: Pre-load ALL existing state timestamps into a set.
+        # This replaces the per-candle DB idempotency check (O(N) DB queries
+        # that get slower as the session accumulates state objects) with a
+        # single DB query + O(1) in-memory set lookups.
+        existing_timestamps: set = set()
+        with SessionLocal() as session:
+            existing_rows = session.scalars(
+                select(HistoricalMarketState.timestamp).where(
+                    HistoricalMarketState.instrument == instrument,
+                    HistoricalMarketState.base_timeframe == base_timeframe,
+                    HistoricalMarketState.feature_version == cfg.feature_version,
+                )
+            ).all()
+            for ts in existing_rows:
+                existing_timestamps.add(ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc))
+        print(f"[build-{job_id}] Pre-loaded {len(existing_timestamps)} existing state timestamps", flush=True)
+
         start_idx = max(cfg.min_history_candles, 0)
         target_candles = h1_instrument[start_idx:]
         now_utc = datetime.now(timezone.utc)
@@ -234,6 +252,32 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
             for c in target_candles:
                 ts_utc = c.timestamp if c.timestamp.tzinfo else c.timestamp.replace(tzinfo=timezone.utc)
                 if (now_utc - ts_utc).total_seconds() < 25 * 3600:
+                    continue
+
+                # Phase 4.2: O(1) idempotency check FIRST — skip all expensive
+                # feature computation for existing states. This was the
+                # critical bottleneck: the old code computed features for
+                # ALL 11,432 candles (O(N²) total) before checking if the
+                # state already existed.
+                if ts_utc in existing_timestamps:
+                    skipped_existing += 1
+                    # Update checkpoint periodically even for skipped states
+                    if (states_built + skipped_existing) % cfg.build_checkpoint_interval == 0:
+                        elapsed = time.monotonic() - started_at
+                        sps = round((states_built + skipped_existing) / elapsed, 2) if elapsed > 0 else None
+                        update_job_progress(
+                            job_id,
+                            built=states_built,
+                            skipped_existing=skipped_existing,
+                            excluded_roll=excluded_roll,
+                            excluded_gaps=excluded_gaps,
+                            excluded_insufficient_future=excluded_insufficient_future,
+                            last_checkpoint_ts=ts_utc,
+                            earliest_state=earliest_ts,
+                            latest_state=latest_ts,
+                            elapsed_seconds=elapsed,
+                            states_per_second=sps,
+                        )
                     continue
 
                 idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
@@ -279,19 +323,7 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
                 directions = [d for d in [h1_dir, h4_dir, d1_dir] if d and d != "INSUFFICIENT_DATA"]
                 alignment = round(sum(1 for d in directions if d == trend) / len(directions), 3) if directions and trend and trend != "INSUFFICIENT_DATA" else None
 
-                # Idempotency check + insert
-                existing = session.scalar(
-                    select(HistoricalMarketState.id).where(
-                        HistoricalMarketState.instrument == instrument,
-                        HistoricalMarketState.base_timeframe == base_timeframe,
-                        HistoricalMarketState.timestamp == ts_utc.replace(tzinfo=None),
-                        HistoricalMarketState.feature_version == cfg.feature_version,
-                    )
-                )
-                if existing is not None:
-                    skipped_existing += 1
-                    continue
-
+                # Phase 4.2: state is new (already checked above) — build it
                 state_row = HistoricalMarketState(
                     instrument=instrument,
                     provider=c.provider,
