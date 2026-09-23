@@ -31,6 +31,14 @@ from app.services.learning import (
     learning_status,
     start_build_job,
 )
+from app.services.forward import (
+    capture_observation,
+    evaluate_pending_observations,
+    get_forward_performance,
+    get_forward_status,
+    get_observation as get_forward_observation,
+    get_observations as get_forward_observations,
+)
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
 from app.services.research import recent_research
@@ -60,13 +68,56 @@ async def lifespan(app: FastAPI):
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(collector_loop(stop_event))
+
+    # Phase 5: forward validation capture + evaluation schedulers.
+    # Capture runs every 15 minutes (aligned to M15 candle close).
+    # Evaluation runs every 5 minutes (evaluates matured horizons).
+    forward_task = asyncio.create_task(_forward_validation_loop(stop_event))
+
     yield
     stop_event.set()
     try:
         await asyncio.wait_for(task, timeout=5)
     except asyncio.TimeoutError:
         task.cancel()
+    try:
+        await asyncio.wait_for(forward_task, timeout=5)
+    except asyncio.TimeoutError:
+        forward_task.cancel()
     engine.dispose()
+
+
+async def _forward_validation_loop(stop_event: asyncio.Event) -> None:
+    """Phase 5: periodic capture + evaluation of forward observations.
+
+    Capture: every 15 minutes (aligned to M15 candle close).
+    Evaluation: every 5 minutes (evaluates matured horizons).
+
+    Restart-safe: pending observations remain in DB and resume automatically.
+    """
+    capture_interval = 900  # 15 minutes
+    eval_interval = 300  # 5 minutes
+    last_capture = 0.0
+    last_eval = 0.0
+
+    from app.services.forward import capture_observation, evaluate_pending_observations
+
+    while not stop_event.is_set():
+        try:
+            now = asyncio.get_event_loop().time()
+            if now - last_capture >= capture_interval:
+                await capture_observation(capture_timeframe="15min")
+                last_capture = now
+            if now - last_eval >= eval_interval:
+                await evaluate_pending_observations()
+                last_eval = now
+        except Exception:
+            pass  # forward validation is best-effort — never break the live feed
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
 
 
 app = FastAPI(
@@ -496,6 +547,74 @@ async def api_learning_run_inspector(run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return run
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Forward validation and live learning audit endpoints
+#
+# These endpoints expose the forward validation system. Observations are
+# immutable snapshots of the Brain's state. Outcomes use XAUUSD_SPOT live
+# data. probability_calibrated remains FALSE. No signal modification.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/forward/status")
+async def api_forward_status():
+    """Forward validation status: total observations, pending/partial/complete/
+    invalid counts, by decision, by alignment, by horizon."""
+    return get_forward_status()
+
+
+@app.get("/api/forward/observations")
+async def api_forward_observations(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Paginated list of forward observations (most recent first)."""
+    return {
+        "observations": get_forward_observations(limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/forward/observations/{observation_id}")
+async def api_forward_observation_detail(observation_id: str):
+    """Single observation with all its outcomes (or PENDING where not yet
+    evaluated). Immutable — the observation itself is never updated."""
+    obs = get_forward_observation(observation_id)
+    if obs is None:
+        raise HTTPException(status_code=404, detail=f"Observation {observation_id} not found")
+    return obs
+
+
+@app.post("/api/forward/capture")
+async def api_forward_capture():
+    """Manually trigger a forward observation capture at the current market
+    state. Also called automatically by the capture scheduler at M15/H1
+    candle closes."""
+    result = await capture_observation()
+    if result.get("skipped"):
+        return result
+    return result
+
+
+@app.get("/api/forward/performance")
+async def api_forward_performance(
+    horizon: int = Query(60, ge=15, le=1440),
+):
+    """Forward performance metrics for one horizon. Groups by technical
+    decision + historical alignment. Reports directional rates with
+    Wilson intervals. Sample quality labeled INSUFFICIENT/EARLY/MODERATE/
+    STRONGER_EVIDENCE — these describe sample size only, NOT prediction
+    quality."""
+    return get_forward_performance(horizon_minutes=horizon)
+
+
+@app.post("/api/forward/evaluate")
+async def api_forward_evaluate():
+    """Manually trigger evaluation of pending forward observations. Also
+    runs automatically via the evaluation scheduler."""
+    return await evaluate_pending_observations()
 
 
 @app.websocket("/ws/market")

@@ -452,3 +452,143 @@ class BuildJob(Base):
     counter_state_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     counter_db_difference: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reconciliation_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ===========================================================================
+# Phase 5: Forward validation and live learning audit
+#
+# Three tables:
+#   1. forward_observations — immutable snapshot of Brain state at capture T
+#   2. forward_outcomes — evaluated outcomes per horizon (XAUUSD_SPOT data)
+#   3. forward_audit_log — system events for debugging
+# ===========================================================================
+
+
+class ForwardObservation(Base):
+    """Phase 5: immutable snapshot of the Brain's state at capture time.
+
+    Once created, NEVER modified — even if the Brain changes one minute
+    later. This preserves exactly what was known at T for true out-of-
+    sample evaluation.
+    """
+
+    __tablename__ = "forward_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "live_instrument", "capture_timeframe", "capture_timestamp",
+            "technical_rule_version", "feature_version",
+            name="uq_fwd_obs_inst_tf_ts_rule_feat",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    observation_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # "FWD-<uuid8>"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    # Live market context
+    live_instrument: Mapped[str] = mapped_column(String(32), index=True)
+    live_provider: Mapped[str] = mapped_column(String(64))
+    live_symbol: Mapped[str] = mapped_column(String(32))
+    live_market_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    live_price: Mapped[float] = mapped_column(Float)
+
+    # Technical engine snapshot (immutable)
+    technical_decision: Mapped[str] = mapped_column(String(16))
+    technical_score: Mapped[float] = mapped_column(Float)
+    technical_rule_version: Mapped[str] = mapped_column(String(16))
+    technical_data_readiness: Mapped[float] = mapped_column(Float)
+
+    # Historical similarity snapshot (immutable)
+    historical_similarity_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    historical_analogue_instrument: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    historical_alignment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    historical_sample_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    historical_direction_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    historical_probability_calibrated: Mapped[bool] = mapped_column(Boolean, default=False)
+    historical_median_mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    historical_median_mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Version tracking
+    feature_version: Mapped[str] = mapped_column(String(16))
+    similarity_version: Mapped[str] = mapped_column(String(16))
+    outcome_version: Mapped[str] = mapped_column(String(16))
+
+    # Market context
+    market_regime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    session: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    h1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    h4_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    d1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    instrument_consistency: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Capture metadata
+    capture_timeframe: Mapped[str] = mapped_column(String(16))  # "15min" or "1h"
+    capture_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    data_freshness_status: Mapped[str] = mapped_column(String(16))  # "RECENT" / "STALE" / "NO_DATA"
+
+    # Lifecycle
+    observation_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    # PENDING → PARTIALLY_EVALUATED → COMPLETE / INVALID
+
+
+class ForwardOutcome(Base):
+    """Phase 5: evaluated outcome for a forward observation at one horizon.
+
+    Uses XAUUSD_SPOT live data (NOT GC futures) for outcome evaluation.
+    This is mandatory — a live XAU spot prediction is evaluated against
+    XAU spot prices, not futures prices.
+    """
+
+    __tablename__ = "forward_outcomes"
+    __table_args__ = (
+        UniqueConstraint("observation_id", "horizon_minutes", name="uq_fwd_outcome_obs_horizon"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    observation_id: Mapped[str] = mapped_column(String(32), index=True)
+    horizon_minutes: Mapped[int] = mapped_column(Integer)
+
+    # Outcome instrument MUST be XAUUSD_SPOT (not GC_FRONT_MONTH)
+    outcome_instrument: Mapped[str] = mapped_column(String(32))  # "XAUUSD_SPOT"
+    outcome_provider: Mapped[str] = mapped_column(String(64))    # "Gold API"
+    outcome_source_timeframe: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    entry_price: Mapped[float] = mapped_column(Float)
+    future_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    absolute_change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    percentage_change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_up_move: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_down_move: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Directional MFE/MAE (computed from max_up_move + max_down_move)
+    buy_mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    buy_mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sell_mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sell_mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)  # UP/DOWN/NEUTRAL/PENDING
+    resolution_sufficient: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    horizon_valid: Mapped[bool] = mapped_column(Boolean, default=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ForwardAuditLog(Base):
+    """Phase 5: system events for debugging forward validation."""
+
+    __tablename__ = "forward_audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    observation_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SystemConfig(Base):
+    """Phase 5: system-level configuration values (key-value store)."""
+
+    __tablename__ = "system_config"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
