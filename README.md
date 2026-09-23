@@ -58,6 +58,20 @@ copy .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
+**Database mode (choose one):**
+
+- **QUICK LOCAL MODE (SQLite, default):** No setup needed. `DATABASE_URL=sqlite:///./forexwizard.db` just works. WAL journal mode is enabled automatically for concurrent read/write support during builds.
+- **RECOMMENDED BRAIN MODE (PostgreSQL):** Install PostgreSQL, create a database, then set `DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/forexwizard` in `.env`. PostgreSQL natively supports concurrent reads during heavy writes — recommended for production-scale learning builds (10k+ historical states).
+
+```powershell
+# PostgreSQL setup (optional, recommended for production)
+pip install "psycopg[binary]"
+# In PostgreSQL:
+#   CREATE DATABASE forexwizard;
+# In .env:
+#   DATABASE_URL=postgresql+psycopg://postgres:password@localhost:5432/forexwizard
+```
+
 Open:
 
 - API: http://localhost:8000

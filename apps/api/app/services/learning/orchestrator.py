@@ -35,9 +35,12 @@ from app.db.models import (
 from app.db.session import SessionLocal
 from app.engine.candles import INTERVALS, get_candles
 from app.engine.indicators import atr as calc_atr
+from app.models.market import Candle
 from app.services.learning.config import DEFAULT_CONFIG, HORIZON_MINUTES, LearningConfig
 from app.services.learning.jobs import (
     create_job,
+    detect_orphaned_jobs,
+    find_running_job,
     get_job,
     mark_job_completed,
     mark_job_failed,
@@ -75,10 +78,26 @@ def start_build_job(
 ) -> dict:
     """Start a background build job. Returns immediately with job_id + status.
 
+    Phase 4.2: Single-build protection — if an equivalent build (same instrument
+    + feature_version) is already RUNNING, return its job_id instead of starting
+    a duplicate.
+
     The actual work runs in an asyncio.create_task — never blocks the
     FastAPI event loop. The dashboard and live market feed continue working.
     """
     cfg = config or DEFAULT_CONFIG
+
+    # Phase 4.2: single-build protection
+    if not resume_job_id:
+        existing_job_id = find_running_job(instrument, cfg.feature_version)
+        if existing_job_id:
+            return {
+                "job_id": existing_job_id,
+                "status": "already_running",
+                "eligible_total": 0,
+                "message": f"A build job is already running for {instrument}/{cfg.feature_version} (job {existing_job_id}). Poll GET /api/learning/jobs/{existing_job_id} for progress.",
+            }
+
     # Pre-compute eligible_total so the API response is accurate immediately.
     eligible_total = _count_eligible_candles(instrument, base_timeframe, cfg.min_history_candles)
 
@@ -95,8 +114,17 @@ def start_build_job(
         if clear_existing:
             _clear_existing_states(instrument)
 
-    # Spawn the background task
-    task = asyncio.create_task(_run_build_job(job_id, instrument, base_timeframe, cfg))
+    # Phase 4.2: spawn the build in a THREAD POOL so its synchronous DB
+    # operations do NOT block the asyncio event loop. The API stays
+    # responsive even during heavy 11k-state writes.
+    # NOTE: the caller (an async FastAPI handler) must call this with
+    # the running event loop. We use asyncio.get_running_loop() which
+    # only works from within an async context.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    task = loop.run_in_executor(None, _run_build_job_sync, job_id, instrument, base_timeframe, cfg)
     _BUILD_TASKS[job_id] = task
     return {"job_id": job_id, "status": "running", "eligible_total": eligible_total}
 
@@ -136,6 +164,272 @@ def _clear_existing_states(instrument: str) -> None:
             )
         )
         session.commit()
+
+
+def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: LearningConfig) -> None:
+    """Phase 4.2: SYNCHRONOUS build worker that runs in a thread pool.
+
+    This is the same logic as the async _run_build_job but fully synchronous —
+    no `await` calls. Runs in a thread via loop.run_in_executor() so its DB
+    operations don't block the asyncio event loop. The API stays responsive.
+
+    Uses synchronous DB sessions + synchronous candle fetching.
+    """
+    import time
+    started_at = time.monotonic()
+    try:
+        builder = HistoricalStateBuilder(base_timeframe=base_timeframe, min_history=cfg.min_history_candles)
+
+        # Fetch H1/H4/D1 ONCE upfront (synchronous via SQLAlchemy)
+        from app.db.models import CandleRecord
+        from sqlalchemy import select as sa_select
+        all_h1_raw = []
+        all_h4_raw = []
+        all_d1_raw = []
+        with SessionLocal() as session:
+            for interval, target_list in [("1h", all_h1_raw), ("4h", all_h4_raw), ("1day", all_d1_raw)]:
+                rows = session.scalars(
+                    sa_select(CandleRecord).where(
+                        CandleRecord.symbol == "XAU/USD",
+                        CandleRecord.interval == interval,
+                    ).order_by(CandleRecord.timestamp.asc())
+                ).all()
+                for r in rows:
+                    target_list.append(Candle(
+                        symbol=r.symbol, interval=r.interval,
+                        timestamp=_ensure_utc(r.timestamp),
+                        open=r.open, high=r.high, low=r.low, close=r.close,
+                        volume=r.volume, sample_count=r.sample_count,
+                        provider=r.provider,
+                        is_historical=r.is_historical,
+                        derivation=getattr(r, "derivation", "DIRECT") or "DIRECT",
+                        provider_symbol=getattr(r, "provider_symbol", "GC=F") or "GC=F",
+                        instrument=getattr(r, "instrument", "GC_FRONT_MONTH") or "GC_FRONT_MONTH",
+                        source_timeframe=getattr(r, "source_timeframe", interval) or interval,
+                        target_timeframe=getattr(r, "target_timeframe", interval) or interval,
+                    ))
+
+        h1_instrument = [c for c in all_h1_raw if getattr(c, "instrument", "") == instrument]
+        h4_instrument = [c for c in all_h4_raw if getattr(c, "instrument", "") == instrument]
+        d1_instrument = [c for c in all_d1_raw if getattr(c, "instrument", "") == instrument]
+        h1_ts_sorted = [c.timestamp for c in h1_instrument]
+
+        start_idx = max(cfg.min_history_candles, 0)
+        target_candles = h1_instrument[start_idx:]
+        now_utc = datetime.now(timezone.utc)
+
+        states_built = 0
+        outcomes_built = 0
+        skipped_existing = 0
+        excluded_roll = 0
+        excluded_gaps = 0
+        excluded_insufficient_future = 0
+        earliest_ts: datetime | None = None
+        latest_ts: datetime | None = None
+
+        update_job_progress(job_id, status="running")
+
+        session = SessionLocal()
+        try:
+            for c in target_candles:
+                ts_utc = c.timestamp if c.timestamp.tzinfo else c.timestamp.replace(tzinfo=timezone.utc)
+                if (now_utc - ts_utc).total_seconds() < 25 * 3600:
+                    continue
+
+                idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
+                candle_window = h1_instrument[:idx]
+                if len(candle_window) < cfg.min_history_candles:
+                    excluded_gaps += 1
+                    continue
+
+                prev_candle = h1_instrument[idx - 2] if idx >= 2 else None
+                atr_val = calc_atr(candle_window[-15:], 14) if len(candle_window) >= 15 else None
+                possible_roll, roll_gap, roll_reason = detect_roll_between(
+                    prev_candle, c, atr_val, roll_atr_multiple=cfg.roll_atr_multiple,
+                )
+
+                # Build feature vector synchronously using the builder's helpers
+                # (the builder's async build_at is replaced with inline sync logic here)
+                closes = [ck.close for ck in candle_window]
+                last_c = candle_window[-1]
+                price = last_c.close
+
+                from app.engine.indicators import ema, rsi, slope
+                ema_fast = ema(closes, 8) if len(closes) >= 8 else None
+                ema_slow = ema(closes, min(20, max(5, len(closes) // 2))) if len(closes) >= 6 else None
+                rsi_val = rsi(closes, 14) if len(closes) >= 15 else None
+                atr_val = calc_atr(candle_window, 14) if len(candle_window) >= 15 else None
+
+                # Reuse the builder's helper methods (they're all sync)
+                trend = builder._trend(candle_window)
+                regime = builder._regime(candle_window)
+                support_low, support_high = builder._support_zone(candle_window, price)
+                resistance_low, resistance_high = builder._resistance_zone(candle_window, price)
+                dist_support = round((price - support_high) / atr_val, 3) if support_high and atr_val and atr_val > 0 else None
+                dist_resist = round((resistance_low - price) / atr_val, 3) if resistance_low and atr_val and atr_val > 0 else None
+                swing_struct, _, _, _, _ = builder._swing_structure(candle_window[-20:])
+                vol_pct = builder._volatility_percentile(candle_window)
+                session_val = builder._session(last_c.timestamp)
+
+                # Multi-TF direction (synchronous — using cached lists)
+                h1_dir = builder._trend([ck for ck in h1_instrument if ck.timestamp <= ts_utc]) if len([ck for ck in h1_instrument if ck.timestamp <= ts_utc]) >= 6 else None
+                h4_dir = builder._trend([ck for ck in h4_instrument if ck.timestamp <= ts_utc]) if len([ck for ck in h4_instrument if ck.timestamp <= ts_utc]) >= 6 else None
+                d1_dir = builder._trend([ck for ck in d1_instrument if ck.timestamp <= ts_utc]) if len([ck for ck in d1_instrument if ck.timestamp <= ts_utc]) >= 6 else None
+
+                directions = [d for d in [h1_dir, h4_dir, d1_dir] if d and d != "INSUFFICIENT_DATA"]
+                alignment = round(sum(1 for d in directions if d == trend) / len(directions), 3) if directions and trend and trend != "INSUFFICIENT_DATA" else None
+
+                # Idempotency check + insert
+                existing = session.scalar(
+                    select(HistoricalMarketState.id).where(
+                        HistoricalMarketState.instrument == instrument,
+                        HistoricalMarketState.base_timeframe == base_timeframe,
+                        HistoricalMarketState.timestamp == ts_utc.replace(tzinfo=None),
+                        HistoricalMarketState.feature_version == cfg.feature_version,
+                    )
+                )
+                if existing is not None:
+                    skipped_existing += 1
+                    continue
+
+                state_row = HistoricalMarketState(
+                    instrument=instrument,
+                    provider=c.provider,
+                    provider_symbol=c.provider_symbol,
+                    timestamp=ts_utc.replace(tzinfo=None),
+                    base_timeframe=base_timeframe,
+                    price=c.close,
+                    ema_fast=None, ema_slow=None,
+                    ema_distance_pct=None,
+                    rsi=rsi_val,
+                    atr=atr_val,
+                    atr_pct=round((atr_val / price) * 100.0, 4) if atr_val and price > 0 else None,
+                    trend=trend,
+                    market_regime=regime,
+                    distance_to_support_atr=dist_support,
+                    distance_to_resistance_atr=dist_resist,
+                    swing_structure=swing_struct,
+                    higher_high=None, higher_low=None, lower_high=None, lower_low=None,
+                    volatility_percentile=vol_pct,
+                    session=session_val,
+                    h1_direction=h1_dir,
+                    h4_direction=h4_dir,
+                    d1_direction=d1_dir,
+                    timeframe_alignment_score=alignment,
+                    source_quality="HEALTHY",
+                    possible_contract_roll=possible_roll,
+                    roll_gap_size=roll_gap,
+                    roll_detection_reason=roll_reason,
+                    feature_version=cfg.feature_version,
+                    similarity_version=cfg.similarity_version,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(state_row)
+                session.flush()
+                state_id = state_row.id
+
+                states_built += 1
+                if earliest_ts is None or ts_utc < earliest_ts:
+                    earliest_ts = ts_utc
+                if latest_ts is None or ts_utc > latest_ts:
+                    latest_ts = ts_utc
+
+                if possible_roll:
+                    excluded_roll += 1
+
+                # Compute outcomes at each horizon (synchronous)
+                forward_idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
+                h1_forward = h1_instrument[forward_idx:]
+                outcomes = _compute_outcomes_inline(
+                    ts_utc=ts_utc,
+                    state_price=c.close,
+                    state_atr=atr_val,
+                    h1_forward=h1_forward,
+                    horizons=HORIZON_MINUTES,
+                    neutral_x=cfg.neutral_x,
+                    max_elapsed_multiple=cfg.max_elapsed_multiple,
+                )
+                for h, w in outcomes.items():
+                    session.add(HistoricalOutcome(
+                        state_id=state_id,
+                        horizon_minutes=h,
+                        future_price=w.get("future_price"),
+                        absolute_change=w.get("absolute_change"),
+                        percentage_change=w.get("percentage_change"),
+                        max_up_move=w.get("max_up_move"),
+                        max_down_move=w.get("max_down_move"),
+                        mfe=w.get("mfe"),
+                        mae=w.get("mae"),
+                        direction=w.get("direction"),
+                        computed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        horizon_valid=w.get("horizon_valid", True),
+                        actual_elapsed_seconds=w.get("actual_elapsed_seconds"),
+                        invalid_reason=w.get("invalid_reason"),
+                        possible_contract_roll=possible_roll,
+                        roll_gap_size=roll_gap,
+                        excluded_from_learning=possible_roll or not w.get("horizon_valid", True),
+                        exclusion_reason=(
+                            "CONTRACT_ROLL_BOUNDARY" if possible_roll
+                            else ("INVALID_HORIZON_WINDOW" if not w.get("horizon_valid", True) else None)
+                        ),
+                    ))
+                    outcomes_built += 1
+
+                # Commit periodically
+                if states_built % cfg.build_batch_size == 0:
+                    session.commit()
+
+                # Checkpoint periodically
+                if states_built % cfg.build_checkpoint_interval == 0:
+                    elapsed = time.monotonic() - started_at
+                    sps = round(states_built / elapsed, 2) if elapsed > 0 and states_built > 0 else None
+                    update_job_progress(
+                        job_id,
+                        built=states_built,
+                        skipped_existing=skipped_existing,
+                        excluded_roll=excluded_roll,
+                        excluded_gaps=excluded_gaps,
+                        excluded_insufficient_future=excluded_insufficient_future,
+                        last_checkpoint_ts=ts_utc,
+                        earliest_state=earliest_ts,
+                        latest_state=latest_ts,
+                        elapsed_seconds=elapsed,
+                        states_per_second=sps,
+                    )
+
+            session.commit()
+        finally:
+            session.close()
+
+        elapsed = time.monotonic() - started_at
+        sps = round(states_built / elapsed, 2) if elapsed > 0 and states_built > 0 else None
+        update_job_progress(
+            job_id,
+            built=states_built,
+            skipped_existing=skipped_existing,
+            excluded_roll=excluded_roll,
+            excluded_gaps=excluded_gaps,
+            excluded_insufficient_future=excluded_insufficient_future,
+            status="completed",
+            last_checkpoint_ts=latest_ts,
+            earliest_state=earliest_ts,
+            latest_state=latest_ts,
+            elapsed_seconds=elapsed,
+            states_per_second=sps,
+        )
+        mark_job_completed(job_id, elapsed_seconds=elapsed)
+
+    except Exception as exc:
+        mark_job_failed(job_id, str(exc))
+    finally:
+        _BUILD_TASKS.pop(job_id, None)
+
+
+def _ensure_utc(dt):
+    from datetime import timezone as _tz
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_tz.utc)
+    return dt.astimezone(_tz.utc)
 
 
 async def _run_build_job(

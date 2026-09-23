@@ -24,6 +24,7 @@ from app.services.historical import (
 from app.services.learning import (
     build_states as build_learning_states,
     current_similarity,
+    detect_orphaned_jobs,
     get_job,
     get_run,
     get_state,
@@ -43,6 +44,19 @@ async def lifespan(app: FastAPI):
         run_startup_migrations()
     except Exception as exc:
         state.last_error = f"Database migration failed: {exc}"
+
+    # Phase 4.2: detect orphaned RUNNING build jobs from a previous process.
+    # Mark them as INTERRUPTED so they can be resumed via the resume endpoint.
+    try:
+        orphans = detect_orphaned_jobs()
+        if orphans:
+            import logging
+            logging.getLogger("forexwizard").info(
+                "startup: detected %d orphaned build jobs: %s — marked as interrupted",
+                len(orphans), orphans,
+            )
+    except Exception:
+        pass  # orphan detection is best-effort
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(collector_loop(stop_event))
@@ -439,6 +453,28 @@ async def api_learning_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return job
+
+
+@app.post("/api/learning/jobs/{job_id}/resume")
+async def api_learning_resume_job(job_id: str):
+    """Phase 4.2: resume an interrupted build job. The job continues from
+    its last checkpoint without duplicating existing states (idempotent
+    dedup on instrument + base_timeframe + timestamp + feature_version)."""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job["status"] == "running":
+        return {"job_id": job_id, "status": "already_running", "message": "Job is already running."}
+    if job["status"] == "completed":
+        return {"job_id": job_id, "status": "completed", "message": "Job already completed."}
+    if job["status"] not in ("interrupted", "failed", "paused"):
+        raise HTTPException(status_code=409, detail=f"Job {job_id} is in state '{job['status']}' — cannot resume.")
+    # Resume the job
+    result = start_build_job(
+        instrument=job["instrument"],
+        resume_job_id=job_id,
+    )
+    return result
 
 
 @app.get("/api/learning/states/{state_id}")

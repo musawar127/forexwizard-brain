@@ -57,7 +57,15 @@ from app.services.learning.outcomes import OutcomeCalculator
 from app.services.learning.roll_detector import detect_roll_between, outcome_window_valid
 from app.services.learning.similarity import SimilarityEngine, SimilarityResult, NeighborMatch
 from app.services.learning.statistics import StatisticsAggregator, SampleQuality, StatisticsSummary
-from app.services.learning.jobs import create_job, get_job, list_active_jobs, new_job_id, new_run_id
+from app.services.learning.jobs import (
+    create_job,
+    detect_orphaned_jobs,
+    find_running_job,
+    get_job,
+    list_active_jobs,
+    new_job_id,
+    new_run_id,
+)
 from app.services.learning.orchestrator import (
     build_states,
     current_similarity,
@@ -84,6 +92,8 @@ __all__ = [
     "SampleQuality",
     "StatisticsSummary",
     "create_job",
+    "detect_orphaned_jobs",
+    "find_running_job",
     "get_job",
     "list_active_jobs",
     "new_job_id",

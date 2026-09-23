@@ -201,3 +201,48 @@ def list_active_jobs() -> list[dict]:
             ).order_by(BuildJob.started_at.desc())
         ).all()
         return [get_job(r.job_id) or {} for r in rows]  # type: ignore
+
+
+# ===========================================================================
+# Phase 4.2: Single-build protection + orphan detection + resume
+# ===========================================================================
+
+def find_running_job(instrument: str, feature_version: str) -> str | None:
+    """Check if an equivalent build job is already RUNNING for the same
+    instrument + feature_version. If so, return its job_id (caller should
+    return that job_id rather than starting a duplicate build).
+
+    Prevents accidentally starting five identical 11k-state builds.
+    """
+    with SessionLocal() as session:
+        job = session.scalar(
+            select(BuildJob).where(
+                BuildJob.instrument == instrument,
+                BuildJob.feature_version == feature_version,
+                BuildJob.status.in_(["queued", "running"]),
+            ).order_by(BuildJob.started_at.desc()).limit(1)
+        )
+        return job.job_id if job else None
+
+
+def detect_orphaned_jobs() -> list[str]:
+    """Phase 4.2: on startup, find all jobs left in 'queued' or 'running'
+    state (their asyncio tasks died when the process restarted). Mark
+    them as 'interrupted' and return their job_ids for potential resume.
+
+    The startup migration also does this via a SQL UPDATE, but this Python
+    function is callable on-demand for testing.
+    """
+    orphan_ids: list[str] = []
+    with SessionLocal() as session:
+        orphans = session.scalars(
+            select(BuildJob).where(
+                BuildJob.status.in_(["queued", "running"])
+            )
+        ).all()
+        for job in orphans:
+            job.status = "interrupted"
+            job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            orphan_ids.append(job.job_id)
+        session.commit()
+    return orphan_ids

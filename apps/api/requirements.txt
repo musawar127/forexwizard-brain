@@ -8,3 +8,6 @@ redis==6.4.0
 python-dotenv==1.1.1
 pytest==8.4.2
 pytest-asyncio==1.2.0
+# Phase 4.2: PostgreSQL production driver (optional — SQLite works for dev).
+# Install with: pip install "psycopg[binary]" or set DATABASE_URL=postgresql+psycopg://...
+psycopg[binary]>=3.2,<4
