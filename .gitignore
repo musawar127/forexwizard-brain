@@ -17,6 +17,24 @@ apps/api/forexwizard.db
 node_modules/
 .next/
 out/
+apps/web/next-env.d.ts
+apps/web/tsconfig.tsbuildinfo
+
+# Runtime logs & pids (workspace-local only)
+logs/
+*.pid
+
+# Local screenshots & verification artifacts (regenerated on demand)
+download/screenshots/
+
+# Workspace download scaffold directory
+download/
+
+# System skill library — NOT part of this project
+skills/
+
+# Upload staging directory
+upload/
 
 # OS/editor
 .DS_Store

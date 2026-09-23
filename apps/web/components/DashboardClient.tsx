@@ -62,7 +62,7 @@ export function DashboardClient() {
           <div><span>Updated</span><strong>{fmtTime(quote?.received_timestamp)}</strong></div>
         </div>
       </section>
-      <DecisionCard brain={brain} />
+      <DecisionCard brain={brain ?? null} />
     </section>
 
     <section className="content-grid">
