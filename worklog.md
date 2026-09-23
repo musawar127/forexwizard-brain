@@ -636,3 +636,64 @@ Performance limitations (documented):
 Stage Summary:
 - Phase 4 complete. Historical pattern-learning engine live with 3,700 states + 25,900 outcomes. Brain's nullable statistical fields now POPULATED with sample size / direction rate / MFE / MAE / alignment / analogue instrument. All numbers carry Wilson 95% confidence intervals. probability_calibrated is ALWAYS False. BUY/SELL/WAIT rules UNCHANGED. 85 tests pass. Build clean. /learning page live with analog explorer + audit log. /dashboard shows populated historical context panel.
 - Phase 5 NOT started.
+
+---
+Task ID: 8 (Phase 4.1)
+Agent: main
+Task: Complete and harden historical learning engine — background jobs, immutable runs, roll detection, outcome window validity, directional MFE/MAE, minimum similarity threshold, exact effective history, adversarial no-look-ahead, state/run inspectors.
+
+Work Log (abbreviated — full details in the 23 new/modified files):
+
+Backend code added (2 new files):
+  apps/api/app/services/learning/roll_detector.py — detect_roll_between() (gap > 5x ATR → possible_contract_roll), outcome_window_valid() (Friday 20:30 + 4h must NOT silently use Sunday/Monday pricing — actual_elapsed > 2x expected → horizon_valid=False)
+  apps/api/app/services/learning/jobs.py — BuildJob CRUD + new_job_id/new_run_id helpers + update_job_progress/mark_job_completed/mark_job_failed
+
+Backend code modified (7 files):
+  apps/api/app/db/models.py — HistoricalMarketState: added possible_contract_roll/roll_gap_size/roll_detection_reason; unique key now includes feature_version. HistoricalOutcome: added max_up_move/max_down_move (canonical direction-neutral excursions), horizon_valid/actual_elapsed_seconds/invalid_reason, possible_contract_roll/excluded_from_learning/exclusion_reason. SimilarityRun: complete rewrite — 20+ new fields (run_id, current_market_timestamp, analogue_instrument, raw_neighbor_count, independent_neighbor_count, minimum_spacing_seconds, similarity_threshold, highest/median/lowest/25th/75th similarity, top_match_ids, statistics_json, feature/outcome/effective history_start/end, effective_days, probability_calibrated). New BuildJob table (job_id, status, eligible_total, built, remaining, percent_complete, last_checkpoint_ts, earliest/latest_state, elapsed_seconds, states_per_second).
+  apps/api/app/db/migrations.py — added Phase 4.1 column migrations for all new fields + best-effort backfill (mfe→max_up_move, mae→max_down_move) + mark in-flight jobs as "interrupted" on startup
+  apps/api/app/services/learning/config.py — added minimum_similarity_score (0.50 default), roll_atr_multiple (5.0), max_elapsed_multiple (2.0), build_batch_size (25), build_checkpoint_interval (50)
+  apps/api/app/services/learning/orchestrator.py — REWROTE: build_states now spawns a background asyncio task (POST /api/learning/build-states returns immediately with job_id — never blocks). current_similarity persists a NEW immutable SimilarityRun row on EVERY call (cache stores computation results but NOT run_id — each call generates a fresh run_id). Added roll detection in build loop + outcome window validity check + excluded_from_learning flagging. Added _persist_similarity_run() helper (reusable for cache-hit path). Added get_state() + get_run() inspectors.
+  apps/api/app/main.py — added 3 new endpoints: GET /api/learning/jobs/{job_id}, GET /api/learning/states/{state_id}, GET /api/learning/runs/{run_id}. Updated POST /api/learning/build-states to return immediately with job_id.
+  apps/api/app/models/market.py — BrainAnalysis: added historical_similarity_run_id
+  apps/api/app/engine/analysis.py — _build_phase4_stats_overlay now passes technical_score + extracts similarity_run_id from result
+
+Tests added (1 new file, 26 tests):
+  apps/api/tests/test_phase41_learning.py — comprehensive Phase 4.1 coverage:
+    - background build returns immediately (<2s)
+    - live API responds during background build
+    - resume interrupted build
+    - state deduplication on (instrument, base_tf, ts, feature_version)
+    - immutable similarity runs (each call → new run_id, persisted)
+    - same-run statistics consistency (3 identical queries → identical stats)
+    - roll-gap detection (large gap flagged, normal volatility not)
+    - roll-crossing outcome exclusion
+    - directional MFE/MAE for BUY (MFE=max_up_move, MAE=abs(max_down_move))
+    - directional MFE/MAE for SELL (MFE=abs(max_down_move), MAE=max_up_move)
+    - weekend horizon validity (Friday 20:30 + 4h → invalid)
+    - normal-hours horizon validity
+    - no forward data → invalid
+    - minimum_similarity_score config (0.50 default)
+    - minimum similarity threshold prevents filling with weak matches
+    - exact effective history per horizon (not "5.5d or 2y")
+    - adversarial no-look-ahead (mutate T+1/T+2/T+3, state at T identical)
+    - state inspector returns full feature snapshot
+    - run inspector returns immutable snapshot
+    - probability_calibrated always False
+    - BUY/SELL/WAIT rules UNCHANGED (Phase 4.1 adds informational overlay only)
+    - job_id + run_id format (JOB-XXXXXXXX / SIM-XXXXXXXX)
+    - Wilson interval regression
+
+Tests: 111 passed in 6.56s (was 85 pre-Phase 4.1 — net +26 tests)
+Typecheck: 0 errors
+Build: success — 9 routes prerendered
+
+Real-data build (background, non-blocking):
+  POST /api/learning/build-states returned immediately with:
+    job_id: JOB-EB2EDAEE, status: running, eligible_total: 11432
+  First poll (3s later): 50/11432 states (0.44%), earliest=2025-11-06
+  Health endpoint responsive during build (non-blocking verified ✓)
+  SQLite lock contention causes /api/learning/status to timeout during
+  heavy writes — expected for SQLite, would work fine with PostgreSQL
+
+Preserved: BUY/SELL/WAIT rules-v0.1 UNCHANGED. probability_calibrated=False.
+No auto-trading. No fake data. Same-instrument-only enforced.

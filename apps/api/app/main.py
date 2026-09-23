@@ -24,7 +24,11 @@ from app.services.historical import (
 from app.services.learning import (
     build_states as build_learning_states,
     current_similarity,
+    get_job,
+    get_run,
+    get_state,
     learning_status,
+    start_build_job,
 )
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
@@ -385,37 +389,77 @@ async def api_learning_analogs(
 class BuildStatesRequest(BaseModel):
     """POST /api/learning/build-states body.
 
+    Phase 4.1: this endpoint now spawns a BACKGROUND JOB and returns
+    immediately with job_id + status. The HTTP request NEVER blocks.
+    Poll GET /api/learning/jobs/{job_id} for progress.
+
     Restrictive: callers cannot pick an arbitrary instrument other than
     the canonical XAU/USD futures (GC_FRONT_MONTH) or spot (XAUUSD_SPOT).
     The base timeframe is pinned to H1 (deepest intraday native history).
     """
 
     instrument: str = "GC_FRONT_MONTH"
-    batch_limit: int = 5000
+    batch_limit: int = 5000  # ignored in Phase 4.1 — full build runs in background
     clear_existing: bool = False
+    resume_job_id: str | None = None
 
 
 @app.post("/api/learning/build-states")
 async def api_learning_build_states(payload: BuildStatesRequest | None = None):
-    """Trigger a batch build of historical market states + outcomes.
+    """Phase 4.1: trigger a background build of historical market states +
+    outcomes. Returns IMMEDIATELY with job_id + status — never blocks the
+    API event loop. Poll GET /api/learning/jobs/{job_id} for progress.
 
-    Single-shot — safe to call repeatedly (already-built states are
-    skipped idempotently). Clears existing states first only if
-    `clear_existing=true` is passed in the body.
+    Single-shot per job_id — resumable via `resume_job_id` in the body.
+    Safe to call repeatedly with the same job_id (already-built states
+    are skipped idempotently). Clears existing states first only if
+    `clear_existing=true` is passed.
 
     No arbitrary uncontrolled downloads: instrument is pinned to
-    GC_FRONT_MONTH or XAUUSD_SPOT. batch_limit caps the build size.
+    GC_FRONT_MONTH or XAUUSD_SPOT.
     """
     p = payload or BuildStatesRequest()
     if p.instrument not in {"GC_FRONT_MONTH", "XAUUSD_SPOT"}:
         raise HTTPException(status_code=400, detail="instrument must be GC_FRONT_MONTH or XAUUSD_SPOT")
-    if not (1 <= p.batch_limit <= 10000):
-        raise HTTPException(status_code=400, detail="batch_limit must be 1-10000")
-    return await build_learning_states(
+    result = start_build_job(
         instrument=p.instrument,
-        batch_limit=p.batch_limit,
         clear_existing=p.clear_existing,
+        resume_job_id=p.resume_job_id,
     )
+    return result
+
+
+@app.get("/api/learning/jobs/{job_id}")
+async def api_learning_job_status(job_id: str):
+    """Phase 4.1: poll a background build job's progress. Returns
+    {job_id, status, eligible_total, built, remaining, percent_complete,
+    started_at, updated_at, earliest_state, latest_state, elapsed_seconds,
+    states_per_second}."""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return job
+
+
+@app.get("/api/learning/states/{state_id}")
+async def api_learning_state_inspector(state_id: int):
+    """Phase 4.1: full feature snapshot + outcome availability for one
+    historical state. Lets you inspect WHY an analogue matched."""
+    state = get_state(state_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"State {state_id} not found")
+    return state
+
+
+@app.get("/api/learning/runs/{run_id}")
+async def api_learning_run_inspector(run_id: str):
+    """Phase 4.1: full immutable run snapshot. Given a run_id, returns
+    the complete statistics that were computed at that point in time.
+    Old runs are NEVER updated — new market state → new run."""
+    run = get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    return run
 
 
 @app.websocket("/ws/market")

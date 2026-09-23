@@ -305,8 +305,10 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
     # Phase 4: populate the nullable statistical fields from the historical
     # similarity engine — INFORMATIONAL ONLY. The BUY/SELL/WAIT decision is
     # unchanged (rules-v0.1). historical_alignment does NOT influence the
-    # decision. probability_calibrated stays False throughout Phase 4.
-    stats_payload = await _build_phase4_stats_overlay(decision)
+    # decision. probability_calibrated stays False throughout Phase 4/4.1.
+    stats_payload = await _build_phase4_stats_overlay(
+        decision, technical_score=round(confidence, 1),
+    )
 
     return BrainAnalysis(
         timestamp=now,
@@ -337,19 +339,22 @@ async def analyze_market(price: float | None, quote_status: str, source_status: 
         historical_mfe=stats_payload.get("historical_mfe"),
         historical_mae=stats_payload.get("historical_mae"),
         historical_probability=stats_payload.get("historical_probability"),
-        probability_calibrated=False,  # ALWAYS False in Phase 4 — calibration is later
+        probability_calibrated=False,  # ALWAYS False in Phase 4/4.1 — calibration is later
         historical_alignment=stats_payload.get("historical_alignment"),
         historical_analogue_instrument=stats_payload.get("historical_analogue_instrument"),
         historical_analogue_horizon_minutes=stats_payload.get("historical_analogue_horizon_minutes"),
         historical_analogue_note=stats_payload.get("historical_analogue_note"),
+        # Phase 4.1: immutable run ID — frontend can show "SIM-XXXXXX"
+        historical_similarity_run_id=stats_payload.get("historical_similarity_run_id"),
     )
 
 
-async def _build_phase4_stats_overlay(technical_decision: str) -> dict:
-    """Phase 4: informational overlay — pull historical similarity stats
-    for the GC_FRONT_MONTH instrument at the 1h horizon. Does NOT
-    influence the BUY/SELL/WAIT decision. Returns empty dict on any
-    error so the Brain never breaks if the learning layer is offline.
+async def _build_phase4_stats_overlay(technical_decision: str, technical_score: float | None = None) -> dict:
+    """Phase 4.1: informational overlay — pulls historical similarity stats
+    for the GC_FRONT_MONTH instrument at the 1h horizon. Persists a NEW
+    immutable SimilarityRun row. Does NOT influence the BUY/SELL/WAIT
+    decision. Returns empty dict on any error so the Brain never breaks
+    if the learning layer is offline.
     """
     try:
         from app.services.learning import current_similarity
@@ -357,10 +362,11 @@ async def _build_phase4_stats_overlay(technical_decision: str) -> dict:
             instrument="GC_FRONT_MONTH",
             horizon_minutes=60,
             technical_decision=technical_decision,
+            technical_score=technical_score,
         )
+        if "error" in result:
+            return {}
         stats = result.get("statistics") or {}
-        # historical_direction_rate = observed rate of the Brain's current
-        # technical direction (BUY→UP rate, SELL→DOWN rate, WAIT→NEUTRAL rate).
         direction_rate = None
         if technical_decision == "BUY":
             direction_rate = stats.get("up_rate", {}).get("rate")
@@ -373,20 +379,17 @@ async def _build_phase4_stats_overlay(technical_decision: str) -> dict:
             "historical_direction_rate": direction_rate,
             "historical_mfe": stats.get("median_mfe"),
             "historical_mae": stats.get("median_mae"),
-            # historical_probability = the observed directional rate (NOT a
-            # calibrated probability). The frontend MUST phrase this as
-            # "Among N similar GC futures historical states, X% produced a
-            # <direction> outcome" — NOT "X% probability of success".
             "historical_probability": direction_rate,
             "historical_alignment": result.get("historical_alignment"),
-            "historical_analogue_instrument": "GC_FRONT_MONTH",
-            "historical_analogue_horizon_minutes": 60,
+            "historical_analogue_instrument": result.get("analogue_instrument", "GC_FRONT_MONTH"),
+            "historical_analogue_horizon_minutes": result.get("horizon_minutes", 60),
             "historical_analogue_note": (
                 "Historical analogue instrument: GC_FRONT_MONTH (Yahoo gold futures). "
                 "Live instrument may be XAUUSD_SPOT — these are SEPARATE instruments. "
                 "Statistics are descriptive observations of similar past states, not "
                 "calibrated probabilities of future outcomes."
             ),
+            "historical_similarity_run_id": result.get("similarity_run_id"),
         }
     except Exception:
         return {}

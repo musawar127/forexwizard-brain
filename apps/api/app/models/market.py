@@ -117,6 +117,11 @@ class BrainAnalysis(BaseModel):
     historical_analogue_instrument: str | None = None
     historical_analogue_horizon_minutes: int | None = None
     historical_analogue_note: str | None = None
+    # Phase 4.1: similarity_run_id — every similarity calculation persists
+    # a NEW immutable SimilarityRun row. BrainAnalysis points to the
+    # latest run for this state. Frontend can show "Historical analysis
+    # ID: SIM-XXXXXX" so users know which run the numbers came from.
+    historical_similarity_run_id: str | None = None
 
 
 class AskRequest(BaseModel):

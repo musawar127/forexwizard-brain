@@ -1,14 +1,14 @@
-"""Phase 3 + 3.1: Lightweight runtime column migration for SQLite.
+"""Phase 3 + 3.1 + 3.2 + 4 + 4.1: Runtime column migration for SQLite.
 
 SQLite supports `ALTER TABLE ... ADD COLUMN` but SQLAlchemy's
 `Base.metadata.create_all` only creates missing tables — it does not
 add columns to existing tables. This helper inspects the existing
-schema and adds the Phase 3 + 3.1 columns at startup without losing
-any sampled-candle history.
+schema and adds the columns at startup without losing any data.
 
-It also backfills lineage metadata (derivation, provider_symbol,
-instrument, source_timeframe, target_timeframe) on existing rows so
-they can be cleanly reported on the /data page after the upgrade.
+It also backfills lineage metadata + handles Phase 4.1 outcome-schema
+migration (max_up_move/max_down_move populated from old mfe/mae fields
+where the historical direction was DOWN/UP respectively — best-effort
+since Phase 4 didn't store direction context).
 """
 
 from __future__ import annotations
@@ -25,9 +25,7 @@ log = logging.getLogger("forexwizard.migrations")
 
 def run_startup_migrations() -> None:
     """Idempotent startup migrations. Safe to call on every boot."""
-    # 1. create_all handles missing tables (HistoricalSyncState,
-    #    HistoricalFeatureSnapshot, BasisObservation) without touching
-    #    existing ones.
+    # 1. create_all handles missing tables.
     Base.metadata.create_all(engine)
 
     # 2. Add Phase 3 + 3.1 columns to CandleRecord if missing.
@@ -75,12 +73,79 @@ def run_startup_migrations() -> None:
     except Exception as exc:
         log.warning("migration: HistoricalSyncState column check failed: %s", exc)
 
-    # 4. Backfill lineage on existing rows (idempotent — only touches rows
-    # whose derivation is NULL or unchanged from the SQL DEFAULT). We run
-    # UPDATE statements that set the lineage based on the `provider` string.
+    # 4. Phase 4.1: add columns to HistoricalMarketState + HistoricalOutcome
+    #    if missing (feature_version in the unique key, roll metadata, etc.)
+    try:
+        inspector = inspect(engine)
+        if "historical_market_states" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("historical_market_states")}
+            needed = [
+                ("possible_contract_roll", "BOOLEAN DEFAULT 0 NOT NULL"),
+                ("roll_gap_size", "FLOAT"),
+                ("roll_detection_reason", "VARCHAR(255)"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE historical_market_states ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to historical_market_states", col_name)
+    except Exception as exc:
+        log.warning("migration: HistoricalMarketState column check failed: %s", exc)
+
+    try:
+        inspector = inspect(engine)
+        if "historical_outcomes" in inspector.get_table_names():
+            columns = {c["name"] for c in inspector.get_columns("historical_outcomes")}
+            needed = [
+                ("max_up_move", "FLOAT"),
+                ("max_down_move", "FLOAT"),
+                ("horizon_valid", "BOOLEAN DEFAULT 1 NOT NULL"),
+                ("actual_elapsed_seconds", "FLOAT"),
+                ("invalid_reason", "VARCHAR(64)"),
+                ("possible_contract_roll", "BOOLEAN DEFAULT 0 NOT NULL"),
+                ("roll_gap_size", "FLOAT"),
+                ("excluded_from_learning", "BOOLEAN DEFAULT 0 NOT NULL"),
+                ("exclusion_reason", "VARCHAR(255)"),
+            ]
+            for col_name, col_type in needed:
+                if col_name not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE historical_outcomes ADD COLUMN {col_name} {col_type}")
+                        )
+                    log.info("migration: added %s column to historical_outcomes", col_name)
+            # Phase 4.1 best-effort backfill: if max_up_move is NULL but mfe
+            # is populated (from Phase 4), copy mfe → max_up_move and mae →
+            # max_down_move. Phase 4 stored direction-agnostic mfe/mae
+            # (just max favorable / max adverse excursion in price terms),
+            # which is exactly max_up_move / max_down_move respectively.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE historical_outcomes SET max_up_move = mfe "
+                        "WHERE max_up_move IS NULL AND mfe IS NOT NULL"
+                    ))
+                    conn.execute(text(
+                        "UPDATE historical_outcomes SET max_down_move = mae "
+                        "WHERE max_down_move IS NULL AND mae IS NOT NULL"
+                    ))
+                    # Mark all existing Phase 4 outcomes as horizon_valid=True
+                    # (Phase 4 didn't track validity — assume valid by default
+                    # for backward compat. New outcomes get explicit checks.)
+                    conn.execute(text(
+                        "UPDATE historical_outcomes SET horizon_valid = 1 "
+                        "WHERE horizon_valid IS NULL OR horizon_valid = 0"
+                    ))
+            except Exception as exc:
+                log.warning("migration: outcome backfill failed (non-fatal): %s", exc)
+    except Exception as exc:
+        log.warning("migration: HistoricalOutcome column check failed: %s", exc)
+
+    # 5. Backfill lineage on existing CandleRecord rows (idempotent).
     try:
         with engine.begin() as conn:
-            # Sampled candles (Gold API spot ticks → candles)
             conn.execute(text(
                 "UPDATE market_candles "
                 "SET derivation='SAMPLED', provider_symbol='XAU', instrument='XAUUSD_SPOT', "
@@ -88,7 +153,6 @@ def run_startup_migrations() -> None:
                 "WHERE provider='Local sampled Gold API' "
                 "  AND (target_timeframe IS NULL OR target_timeframe = '')"
             ))
-            # Direct-fetch historical candles (Yahoo native interval)
             conn.execute(text(
                 "UPDATE market_candles "
                 "SET derivation='DIRECT', provider_symbol='GC=F', instrument='GC_FRONT_MONTH', "
@@ -96,7 +160,6 @@ def run_startup_migrations() -> None:
                 "WHERE provider='Yahoo Finance (GC=F)' "
                 "  AND (target_timeframe IS NULL OR target_timeframe = '')"
             ))
-            # Direct-fetch historical candles (Twelve Data native interval)
             conn.execute(text(
                 "UPDATE market_candles "
                 "SET derivation='DIRECT', provider_symbol='XAU/USD', instrument='XAUUSD_SPOT', "
@@ -104,9 +167,6 @@ def run_startup_migrations() -> None:
                 "WHERE provider='Twelve Data (XAU/USD spot)' "
                 "  AND (target_timeframe IS NULL OR target_timeframe = '')"
             ))
-            # Aggregated candles — Phase 3 stored these with provider strings
-            # like "Yahoo Finance (GC=F) (aggregated to 5min)". Extract the
-            # target TF from the provider string with a simple LIKE pattern.
             for tf in ("1min", "5min", "15min", "30min", "1h", "4h", "1day"):
                 conn.execute(text(
                     f"UPDATE market_candles "
@@ -117,3 +177,14 @@ def run_startup_migrations() -> None:
                 ))
     except Exception as exc:
         log.warning("migration: lineage backfill failed (non-fatal): %s", exc)
+
+    # 6. Phase 4.1: mark any in-flight BuildJobs as "interrupted" on startup.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE build_jobs SET status='interrupted', "
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE status IN ('queued', 'running')"
+            ))
+    except Exception as exc:
+        log.warning("migration: BuildJob cleanup failed (non-fatal): %s", exc)

@@ -1,15 +1,15 @@
-"""Phase 4: orchestrator (optimized).
+"""Phase 4.1: orchestrator (rewritten for immutability + background jobs).
 
-build_states() — batch builder. Fetches H1/H4/D1 candles ONCE upfront
-(O(1) DB calls) and slices them per-state, avoiding the catastrophic
-N+1 query pattern. Iterates over historical H1 candles, builds a state
-per candle (with no-look-ahead), computes outcomes at each horizon,
-and persists everything to historical_market_states + historical_outcomes.
+build_states_async() — background task. Iterates over ALL eligible H1
+candles (full 2-year history, no artificial cap). Uses bisect-slicing
++ single-session DB writes + periodic checkpoints. Updates the
+BuildJob row with progress. NEVER blocks the API event loop.
 
-current_similarity() — live matcher. Builds a feature vector for the
-current market state, finds the nearest K historical neighbors (with
-temporal de-duplication), aggregates their outcome statistics, and
-returns the full result.
+current_similarity() — live matcher. Persists a NEW immutable
+SimilarityRun row with full snapshot (run_id, statistics, top_match_ids,
+similarity distribution, effective history). BrainAnalysis.historical_
+similarity_run_id points to the latest run. Old runs are NEVER updated
+— new market state → new run.
 
 learning_status() — overall status for /api/learning/status.
 """
@@ -19,11 +19,15 @@ from __future__ import annotations
 import asyncio
 import bisect
 import json
+import uuid
 from datetime import datetime, timezone
+from statistics import median as py_median
+from statistics import quantiles as py_quantiles
 
 from sqlalchemy import delete, func, select
 
 from app.db.models import (
+    BuildJob,
     HistoricalMarketState,
     HistoricalOutcome,
     SimilarityRun,
@@ -32,261 +36,328 @@ from app.db.session import SessionLocal
 from app.engine.candles import INTERVALS, get_candles
 from app.engine.indicators import atr as calc_atr
 from app.services.learning.config import DEFAULT_CONFIG, HORIZON_MINUTES, LearningConfig
+from app.services.learning.jobs import (
+    create_job,
+    get_job,
+    mark_job_completed,
+    mark_job_failed,
+    new_run_id,
+    update_job_progress,
+)
 from app.services.learning.outcomes import OutcomeCalculator
+from app.services.learning.roll_detector import detect_roll_between, outcome_window_valid
 from app.services.learning.similarity import NeighborMatch, SimilarityEngine
 from app.services.learning.states import FeatureVector, HistoricalStateBuilder
-from app.services.learning.statistics import StatisticsAggregator
+from app.services.learning.statistics import (
+    StatisticsAggregator,
+    percentile,
+    wilson_interval,
+)
 
-# Cache for current_similarity results — short TTL to avoid recomputing
-# on every frontend refresh tick.
+# In-memory registry of running asyncio tasks so we can cancel on shutdown.
+_BUILD_TASKS: dict[str, asyncio.Task] = {}
+# Cache for current_similarity results — short TTL.
 _SIMILARITY_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
 _CACHE_TTL_SECONDS = 30.0
 
 
-async def build_states(
+# ===========================================================================
+# Background state-builder
+# ===========================================================================
+
+def start_build_job(
     *,
     instrument: str = "GC_FRONT_MONTH",
     base_timeframe: str = "1h",
     config: LearningConfig | None = None,
-    batch_limit: int = 5000,
     clear_existing: bool = False,
+    resume_job_id: str | None = None,
 ) -> dict:
-    """Batch-build historical market states + outcomes.
+    """Start a background build job. Returns immediately with job_id + status.
 
-    Phase 4 optimized: fetches H1/H4/D1 candle lists ONCE upfront and
-    slices per-state, avoiding the N+1 query pattern that made the
-    naive version hang on 11k candles.
+    The actual work runs in an asyncio.create_task — never blocks the
+    FastAPI event loop. The dashboard and live market feed continue working.
     """
     cfg = config or DEFAULT_CONFIG
-    builder = HistoricalStateBuilder(base_timeframe=base_timeframe, min_history=cfg.min_history_candles)
-    outcome_calc = OutcomeCalculator(neutral_x=cfg.neutral_x)
+    # Pre-compute eligible_total so the API response is accurate immediately.
+    eligible_total = _count_eligible_candles(instrument, base_timeframe, cfg.min_history_candles)
 
-    if clear_existing:
-        with SessionLocal() as session:
-            session.execute(
-                delete(HistoricalOutcome).where(
-                    HistoricalOutcome.state_id.in_(
-                        select(HistoricalMarketState.id).where(
-                            HistoricalMarketState.instrument == instrument
-                        )
+    if resume_job_id:
+        job_id = resume_job_id
+        update_job_progress(job_id, status="running")
+    else:
+        job_id = create_job(
+            instrument=instrument,
+            base_timeframe=base_timeframe,
+            feature_version=cfg.feature_version,
+            eligible_total=eligible_total,
+        )
+        if clear_existing:
+            _clear_existing_states(instrument)
+
+    # Spawn the background task
+    task = asyncio.create_task(_run_build_job(job_id, instrument, base_timeframe, cfg))
+    _BUILD_TASKS[job_id] = task
+    return {"job_id": job_id, "status": "running", "eligible_total": eligible_total}
+
+
+def _count_eligible_candles(instrument: str, base_timeframe: str, min_history: int) -> int:
+    """Count how many eligible H1 candles exist (need >= min_history lookback)."""
+    # Synchronous DB query — acceptable since this is called once at job start.
+    from app.db.models import CandleRecord
+    with SessionLocal() as session:
+        total = session.scalar(
+            select(func.count(CandleRecord.id)).where(
+                CandleRecord.instrument == instrument,
+                CandleRecord.interval == base_timeframe,
+                CandleRecord.is_historical.is_(True),
+            )
+        ) or 0
+    # Subtract min_history because the first min_history candles can't build states.
+    return max(0, total - min_history)
+
+
+def _clear_existing_states(instrument: str) -> None:
+    """Delete all historical states + outcomes for this instrument.
+    Use carefully — preserves audit runs."""
+    with SessionLocal() as session:
+        session.execute(
+            delete(HistoricalOutcome).where(
+                HistoricalOutcome.state_id.in_(
+                    select(HistoricalMarketState.id).where(
+                        HistoricalMarketState.instrument == instrument
                     )
                 )
             )
-            session.execute(
-                delete(HistoricalMarketState).where(
-                    HistoricalMarketState.instrument == instrument
-                )
+        )
+        session.execute(
+            delete(HistoricalMarketState).where(
+                HistoricalMarketState.instrument == instrument
             )
-            session.commit()
-
-    # ----- PHASE 4 PERFORMANCE OPTIMIZATION -----
-    # Fetch H1/H4/D1 candles ONCE upfront — slice per-state to avoid N+1.
-    all_h1 = await get_candles("1h", 5000, "XAU/USD")
-    all_h4 = await get_candles("4h", 5000, "XAU/USD")
-    all_d1 = await get_candles("1day", 5000, "XAU/USD")
-
-    h1_instrument = [c for c in all_h1 if getattr(c, "instrument", "") == instrument]
-    h4_instrument = [c for c in all_h4 if getattr(c, "instrument", "") == instrument]
-    d1_instrument = [c for c in all_d1 if getattr(c, "instrument", "") == instrument]
-
-    # Pre-compute sorted timestamp arrays for bisect-based slicing (O(log N) per slice).
-    h1_ts_sorted = [c.timestamp for c in h1_instrument]  # already sorted asc by get_candles
-    h1_forward_ts_sorted = h1_ts_sorted  # alias
-
-    # Only build states for candles AFTER min_history_candles (need enough
-    # lookback for indicators).
-    start_idx = max(cfg.min_history_candles, 0)
-    target_candles = h1_instrument[start_idx:][:batch_limit]
-
-    states_built = 0
-    outcomes_built = 0
-    states_with_insufficient_forward_data: dict[int, int] = {h: 0 for h in HORIZON_MINUTES}
-    earliest_ts: datetime | None = None
-    latest_ts: datetime | None = None
-    now_utc = datetime.now(timezone.utc)
-    skipped_recent = 0  # candles too recent to have 24h forward data
-
-    # Single DB session for the whole build (massive speedup vs per-state session).
-    session = SessionLocal()
-    try:
-        for c in target_candles:
-            ts_utc = c.timestamp if c.timestamp.tzinfo else c.timestamp.replace(tzinfo=timezone.utc)
-            # Skip the last 24h of candles — they won't have full outcome windows
-            # at the 24h horizon.
-            if (now_utc - ts_utc).total_seconds() < 24 * 3600 + 3600:
-                skipped_recent += 1
-                continue
-
-            # Bisect-based slice for candles <= T (O(log N), not O(N))
-            idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
-            candle_window = h1_instrument[:idx]
-            if len(candle_window) < cfg.min_history_candles:
-                continue
-            fv = await builder.build_at(
-                instrument, ts_utc,
-                candles=h1_instrument,
-                h1_candles=h1_instrument,
-                h4_candles=h4_instrument,
-                d1_candles=d1_instrument,
-            )
-            if fv is None:
-                continue
-
-            # Compute ATR for outcome direction classification
-            atr_val = calc_atr(candle_window[-15:], 14) if len(candle_window) >= 15 else None
-
-            # Idempotency check + insert in the same session
-            existing = session.scalar(
-                select(HistoricalMarketState.id).where(
-                    HistoricalMarketState.instrument == instrument,
-                    HistoricalMarketState.base_timeframe == base_timeframe,
-                    HistoricalMarketState.timestamp == ts_utc.replace(tzinfo=None),
-                )
-            )
-            if existing is not None:
-                continue  # idempotent — skip already-built states
-
-            state_row = HistoricalMarketState(
-                instrument=instrument,
-                provider=c.provider,
-                provider_symbol=c.provider_symbol,
-                timestamp=ts_utc.replace(tzinfo=None),
-                base_timeframe=base_timeframe,
-                price=c.close,
-                ema_fast=None, ema_slow=None,
-                ema_distance_pct=None,
-                rsi=fv.rsi_normalized * 100.0 if fv.rsi_normalized is not None else None,
-                atr=atr_val,
-                atr_pct=fv.atr_pct,
-                trend=fv.trend,
-                market_regime=fv.market_regime,
-                distance_to_support_atr=fv.distance_to_support_atr,
-                distance_to_resistance_atr=fv.distance_to_resistance_atr,
-                swing_structure=fv.swing_structure,
-                higher_high=None, higher_low=None, lower_high=None, lower_low=None,
-                volatility_percentile=fv.volatility_percentile,
-                session=fv.session,
-                h1_direction=fv.h1_direction,
-                h4_direction=fv.h4_direction,
-                d1_direction=fv.d1_direction,
-                timeframe_alignment_score=fv.timeframe_alignment_score,
-                source_quality="HEALTHY",
-                feature_version=cfg.feature_version,
-                similarity_version=cfg.similarity_version,
-                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
-            )
-            session.add(state_row)
-            session.flush()  # flush to get state_row.id without committing
-            state_id = state_row.id
-
-            states_built += 1
-            if earliest_ts is None or ts_utc < earliest_ts:
-                earliest_ts = ts_utc
-            if latest_ts is None or ts_utc > latest_ts:
-                latest_ts = ts_utc
-
-            # Compute outcomes at each horizon (forward-only, no look-ahead)
-            # Bisect slice for forward candles
-            forward_idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
-            h1_forward = h1_instrument[forward_idx:]
-            outcomes = await _compute_outcomes_inline(
-                ts_utc=ts_utc,
-                state_price=c.close,
-                state_atr=atr_val,
-                h1_forward=h1_forward,
-                horizons=HORIZON_MINUTES,
-                neutral_x=cfg.neutral_x,
-            )
-            for h, w in outcomes.items():
-                if w.direction is None or w.direction == "NULL":
-                    states_with_insufficient_forward_data[h] += 1
-                session.add(HistoricalOutcome(
-                    state_id=state_id,
-                    horizon_minutes=h,
-                    future_price=w.future_price,
-                    absolute_change=w.absolute_change,
-                    percentage_change=w.percentage_change,
-                    mfe=w.mfe,
-                    mae=w.mae,
-                    maximum_up_move=w.maximum_up_move,
-                    maximum_down_move=w.maximum_down_move,
-                    direction=w.direction,
-                    computed_at=datetime.now(timezone.utc).replace(tzinfo=None),
-                ))
-                outcomes_built += 1
-
-            # Commit periodically (every 25 states) to avoid massive
-            # transaction overhead but also avoid per-row commits.
-            if states_built % 25 == 0:
-                session.commit()
-                await asyncio.sleep(0)  # yield to event loop
-        # Final commit
+        )
         session.commit()
+
+
+async def _run_build_job(
+    job_id: str,
+    instrument: str,
+    base_timeframe: str,
+    cfg: LearningConfig,
+) -> None:
+    """Background build worker. Updates BuildJob progress periodically.
+
+    NEVER raises — catches all exceptions and marks the job as failed so
+    the API event loop stays healthy.
+    """
+    started_at = datetime.now(timezone.utc)
+    try:
+        builder = HistoricalStateBuilder(base_timeframe=base_timeframe, min_history=cfg.min_history_candles)
+
+        # Fetch H1/H4/D1 ONCE upfront
+        all_h1 = await get_candles("1h", 5000, "XAU/USD")
+        all_h4 = await get_candles("4h", 5000, "XAU/USD")
+        all_d1 = await get_candles("1day", 5000, "XAU/USD")
+        h1_instrument = [c for c in all_h1 if getattr(c, "instrument", "") == instrument]
+        h4_instrument = [c for c in all_h4 if getattr(c, "instrument", "") == instrument]
+        d1_instrument = [c for c in all_d1 if getattr(c, "instrument", "") == instrument]
+        h1_ts_sorted = [c.timestamp for c in h1_instrument]  # already sorted asc
+
+        start_idx = max(cfg.min_history_candles, 0)
+        target_candles = h1_instrument[start_idx:]
+        now_utc = datetime.now(timezone.utc)
+
+        states_built = 0
+        outcomes_built = 0
+        skipped_existing = 0
+        excluded_roll = 0
+        excluded_gaps = 0
+        excluded_insufficient_future = 0
+        earliest_ts: datetime | None = None
+        latest_ts: datetime | None = None
+
+        update_job_progress(job_id, status="running")
+
+        session = SessionLocal()
+        try:
+            for c in target_candles:
+                ts_utc = c.timestamp if c.timestamp.tzinfo else c.timestamp.replace(tzinfo=timezone.utc)
+                # Skip the last 25h of candles (need full 24h forward data)
+                if (now_utc - ts_utc).total_seconds() < 25 * 3600:
+                    continue
+
+                # Bisect slice for candles <= T
+                idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
+                candle_window = h1_instrument[:idx]
+                if len(candle_window) < cfg.min_history_candles:
+                    excluded_gaps += 1
+                    continue
+
+                # Roll detection: check the gap between this candle's open and
+                # the previous candle's close. If > roll_atr_multiple * ATR,
+                # mark as possible_contract_roll and exclude from learning.
+                prev_candle = h1_instrument[idx - 2] if idx >= 2 else None
+                atr_val = calc_atr(candle_window[-15:], 14) if len(candle_window) >= 15 else None
+                possible_roll, roll_gap, roll_reason = detect_roll_between(
+                    prev_candle, c, atr_val, roll_atr_multiple=cfg.roll_atr_multiple,
+                )
+
+                # Build feature vector (no look-ahead)
+                fv = await builder.build_at(
+                    instrument, ts_utc,
+                    candles=h1_instrument,
+                    h1_candles=h1_instrument,
+                    h4_candles=h4_instrument,
+                    d1_candles=d1_instrument,
+                )
+                if fv is None:
+                    excluded_gaps += 1
+                    continue
+
+                # Idempotency check + insert
+                existing = session.scalar(
+                    select(HistoricalMarketState.id).where(
+                        HistoricalMarketState.instrument == instrument,
+                        HistoricalMarketState.base_timeframe == base_timeframe,
+                        HistoricalMarketState.timestamp == ts_utc.replace(tzinfo=None),
+                        HistoricalMarketState.feature_version == cfg.feature_version,
+                    )
+                )
+                if existing is not None:
+                    skipped_existing += 1
+                    continue
+
+                state_row = HistoricalMarketState(
+                    instrument=instrument,
+                    provider=c.provider,
+                    provider_symbol=c.provider_symbol,
+                    timestamp=ts_utc.replace(tzinfo=None),
+                    base_timeframe=base_timeframe,
+                    price=c.close,
+                    ema_fast=None, ema_slow=None,
+                    ema_distance_pct=None,
+                    rsi=fv.rsi_normalized * 100.0 if fv.rsi_normalized is not None else None,
+                    atr=atr_val,
+                    atr_pct=fv.atr_pct,
+                    trend=fv.trend,
+                    market_regime=fv.market_regime,
+                    distance_to_support_atr=fv.distance_to_support_atr,
+                    distance_to_resistance_atr=fv.distance_to_resistance_atr,
+                    swing_structure=fv.swing_structure,
+                    higher_high=None, higher_low=None, lower_high=None, lower_low=None,
+                    volatility_percentile=fv.volatility_percentile,
+                    session=fv.session,
+                    h1_direction=fv.h1_direction,
+                    h4_direction=fv.h4_direction,
+                    d1_direction=fv.d1_direction,
+                    timeframe_alignment_score=fv.timeframe_alignment_score,
+                    source_quality="HEALTHY",
+                    possible_contract_roll=possible_roll,
+                    roll_gap_size=roll_gap,
+                    roll_detection_reason=roll_reason,
+                    feature_version=cfg.feature_version,
+                    similarity_version=cfg.similarity_version,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(state_row)
+                session.flush()
+                state_id = state_row.id
+
+                states_built += 1
+                if earliest_ts is None or ts_utc < earliest_ts:
+                    earliest_ts = ts_utc
+                if latest_ts is None or ts_utc > latest_ts:
+                    latest_ts = ts_utc
+
+                if possible_roll:
+                    excluded_roll += 1
+
+                # Compute outcomes at each horizon — forward-only, no look-ahead
+                forward_idx = bisect.bisect_right(h1_ts_sorted, ts_utc)
+                h1_forward = h1_instrument[forward_idx:]
+                outcomes = _compute_outcomes_inline(
+                    ts_utc=ts_utc,
+                    state_price=c.close,
+                    state_atr=atr_val,
+                    h1_forward=h1_forward,
+                    horizons=HORIZON_MINUTES,
+                    neutral_x=cfg.neutral_x,
+                    max_elapsed_multiple=cfg.max_elapsed_multiple,
+                )
+                for h, w in outcomes.items():
+                    session.add(HistoricalOutcome(
+                        state_id=state_id,
+                        horizon_minutes=h,
+                        future_price=w.get("future_price"),
+                        absolute_change=w.get("absolute_change"),
+                        percentage_change=w.get("percentage_change"),
+                        max_up_move=w.get("max_up_move"),
+                        max_down_move=w.get("max_down_move"),
+                        mfe=w.get("mfe"),         # legacy field — direction-agnostic
+                        mae=w.get("mae"),          # legacy field — direction-agnostic
+                        direction=w.get("direction"),
+                        computed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        horizon_valid=w.get("horizon_valid", True),
+                        actual_elapsed_seconds=w.get("actual_elapsed_seconds"),
+                        invalid_reason=w.get("invalid_reason"),
+                        possible_contract_roll=possible_roll,
+                        roll_gap_size=roll_gap,
+                        excluded_from_learning=possible_roll or not w.get("horizon_valid", True),
+                        exclusion_reason=(
+                            "CONTRACT_ROLL_BOUNDARY" if possible_roll
+                            else ("INVALID_HORIZON_WINDOW" if not w.get("horizon_valid", True) else None)
+                        ),
+                    ))
+                    outcomes_built += 1
+
+                # Commit + checkpoint periodically
+                if states_built % cfg.build_batch_size == 0:
+                    session.commit()
+                    await asyncio.sleep(0)  # yield to event loop
+
+                if states_built % cfg.build_checkpoint_interval == 0:
+                    update_job_progress(
+                        job_id,
+                        built=states_built,
+                        skipped_existing=skipped_existing,
+                        excluded_roll=excluded_roll,
+                        excluded_gaps=excluded_gaps,
+                        excluded_insufficient_future=excluded_insufficient_future,
+                        last_checkpoint_ts=ts_utc,
+                        earliest_state=earliest_ts,
+                        latest_state=latest_ts,
+                        elapsed_seconds=(datetime.now(timezone.utc) - started_at).total_seconds(),
+                    )
+
+            # Final commit
+            session.commit()
+        finally:
+            session.close()
+
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        sps = round(states_built / elapsed, 2) if elapsed > 0 and states_built > 0 else None
+        update_job_progress(
+            job_id,
+            built=states_built,
+            skipped_existing=skipped_existing,
+            excluded_roll=excluded_roll,
+            excluded_gaps=excluded_gaps,
+            excluded_insufficient_future=excluded_insufficient_future,
+            status="completed",
+            last_checkpoint_ts=latest_ts,
+            earliest_state=earliest_ts,
+            latest_state=latest_ts,
+            elapsed_seconds=elapsed,
+            states_per_second=sps,
+        )
+        mark_job_completed(job_id, elapsed_seconds=elapsed)
+
+    except Exception as exc:
+        mark_job_failed(job_id, str(exc))
     finally:
-        session.close()
-
-    # Effective historical range per horizon — based on what data was actually used.
-    effective_range = {
-        "15m": "5.5d (M1) or 2y (H1-derived)",
-        "30m": "5.5d (M1) or 2y (H1-derived)",
-        "1h": "2y (H1)",
-        "2h": "2y (H1)",
-        "4h": "2y (H1)",
-        "8h": "2y (H1)",
-        "24h": "2y (H1) or 10y (D1)",
-    }
-
-    return {
-        "instrument": instrument,
-        "base_timeframe": base_timeframe,
-        "feature_version": cfg.feature_version,
-        "similarity_version": cfg.similarity_version,
-        "states_built": states_built,
-        "outcomes_built": outcomes_built,
-        "skipped_recent": skipped_recent,
-        "earliest_state": earliest_ts.isoformat() if earliest_ts else None,
-        "latest_state": latest_ts.isoformat() if latest_ts else None,
-        "states_with_insufficient_forward_data": states_with_insufficient_forward_data,
-        "effective_range_per_horizon": effective_range,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }
+        _BUILD_TASKS.pop(job_id, None)
 
 
-def _override_multi_tf_directions(
-    fv: FeatureVector,
-    h1_instrument: list,
-    h4_instrument: list,
-    d1_instrument: list,
-    ts_utc: datetime,
-) -> FeatureVector:
-    """Re-compute multi-TF directions at T using pre-fetched candle lists
-    (avoiding the builder's per-state DB fetch)."""
-    builder = HistoricalStateBuilder()
-    h1_at_t = [c for c in h1_instrument if c.timestamp <= ts_utc]
-    h4_at_t = [c for c in h4_instrument if c.timestamp <= ts_utc]
-    d1_at_t = [c for c in d1_instrument if c.timestamp <= ts_utc]
-    h1_dir = builder._trend(h1_at_t) if len(h1_at_t) >= 6 else None
-    h4_dir = builder._trend(h4_at_t) if len(h4_at_t) >= 6 else None
-    d1_dir = builder._trend(d1_at_t) if len(d1_at_t) >= 6 else None
-    return FeatureVector(
-        rsi_normalized=fv.rsi_normalized,
-        ema_distance_atr=fv.ema_distance_atr,
-        atr_pct=fv.atr_pct,
-        distance_to_support_atr=fv.distance_to_support_atr,
-        distance_to_resistance_atr=fv.distance_to_resistance_atr,
-        volatility_percentile=fv.volatility_percentile,
-        timeframe_alignment_score=fv.timeframe_alignment_score,
-        trend=fv.trend,
-        market_regime=fv.market_regime,
-        swing_structure=fv.swing_structure,
-        h1_direction=h1_dir,
-        h4_direction=h4_dir,
-        d1_direction=d1_dir,
-        session=fv.session,
-    )
-
-
-async def _compute_outcomes_inline(
+def _compute_outcomes_inline(
     *,
     ts_utc: datetime,
     state_price: float,
@@ -294,21 +365,20 @@ async def _compute_outcomes_inline(
     h1_forward: list,
     horizons: tuple[int, ...],
     neutral_x: float,
-) -> dict[int, "OutcomeWindow"]:
-    """Inline outcome calculator using pre-fetched forward H1 candles
-    (avoids per-state DB fetch in OutcomeCalculator)."""
-    from app.services.learning.outcomes import OutcomeWindow
+    max_elapsed_multiple: float,
+) -> dict[int, dict]:
+    """Compute outcome windows at each horizon. Returns dict keyed by horizon.
+    Stores CANONICAL max_up_move + max_down_move (direction-neutral)."""
     h1_seconds = INTERVALS["1h"]
-    results: dict[int, OutcomeWindow] = {}
+    results: dict[int, dict] = {}
     for horizon in horizons:
         candles_needed = max(1, horizon * 60 // h1_seconds)
         if len(h1_forward) < candles_needed:
-            results[horizon] = OutcomeWindow(
-                horizon_minutes=horizon,
-                future_price=None, absolute_change=None, percentage_change=None,
-                mfe=None, mae=None, maximum_up_move=None, maximum_down_move=None,
-                direction="NULL",
-            )
+            results[horizon] = {
+                "horizon_valid": False,
+                "invalid_reason": "insufficient forward data",
+                "direction": "NULL",
+            }
             continue
         window = h1_forward[:candles_needed]
         future_price = window[-1].close
@@ -316,8 +386,10 @@ async def _compute_outcomes_inline(
         percentage_change = (absolute_change / state_price) * 100.0 if state_price > 0 else None
         max_high = max(c.high for c in window)
         min_low = min(c.low for c in window)
-        mfe = round(max_high - state_price, 4)
-        mae = round(state_price - min_low, 4)
+        # Phase 4.1: canonical direction-neutral excursions
+        max_up_move = round(max_high - state_price, 4)  # >= 0
+        max_down_move = round(state_price - min_low, 4)  # >= 0
+
         # Direction classification — volatility-aware
         if state_atr is not None and state_atr > 0:
             normalized = abs(absolute_change) / state_atr
@@ -331,17 +403,40 @@ async def _compute_outcomes_inline(
                 direction = "NEUTRAL"
             else:
                 direction = "UP" if absolute_change > 0 else "DOWN"
-        results[horizon] = OutcomeWindow(
-            horizon_minutes=horizon,
-            future_price=round(future_price, 4),
-            absolute_change=round(absolute_change, 4),
-            percentage_change=round(percentage_change, 4) if percentage_change is not None else None,
-            mfe=mfe, mae=mae,
-            maximum_up_move=mfe, maximum_down_move=mae,
-            direction=direction,
+
+        # Phase 4.1: window validity check (Friday 20:30 + 4h must not be
+        # Sunday/Monday pricing silently)
+        valid, actual_elapsed, invalid_reason = outcome_window_valid(
+            ts_utc, window, horizon_minutes=horizon,
+            max_elapsed_multiple=max_elapsed_multiple,
         )
+
+        # Legacy mfe/mae fields (direction-agnostic — preserved for backward
+        # compat; new code uses max_up_move/max_down_move + direction).
+        # For Phase 4 backward compat, store mfe = max(max_up_move, max_down_move)
+        # and mae = min(max_up_move, max_down_move). This is the Phase 4 semantic.
+        legacy_mfe = max(max_up_move, max_down_move)
+        legacy_mae = min(max_up_move, max_down_move)
+
+        results[horizon] = {
+            "future_price": round(future_price, 4),
+            "absolute_change": round(absolute_change, 4),
+            "percentage_change": round(percentage_change, 4) if percentage_change is not None else None,
+            "max_up_move": max_up_move,
+            "max_down_move": max_down_move,
+            "mfe": legacy_mfe,         # legacy field
+            "mae": legacy_mae,          # legacy field
+            "direction": direction,
+            "horizon_valid": valid,
+            "actual_elapsed_seconds": actual_elapsed,
+            "invalid_reason": invalid_reason if not valid else None,
+        }
     return results
 
+
+# ===========================================================================
+# Current similarity matcher (immutable run persistence)
+# ===========================================================================
 
 async def current_similarity(
     *,
@@ -349,21 +444,77 @@ async def current_similarity(
     horizon_minutes: int = 60,
     config: LearningConfig | None = None,
     technical_decision: str | None = None,
+    technical_score: float | None = None,
 ) -> dict:
-    """Find historical neighbors of the current market state + report stats."""
+    """Find historical neighbors of the current market state + persist a NEW
+    immutable SimilarityRun row. Returns the full result including run_id.
+
+    Phase 4.1: every call creates a NEW run_id + persists a NEW SimilarityRun
+    row. The 30-second computation cache reuses the MATCHING RESULTS (candidates,
+    ranking, stats) for speed, but the run_id is always fresh.
+    """
     cfg = config or DEFAULT_CONFIG
     cache_key = (instrument, horizon_minutes)
-    now_ts = asyncio.get_event_loop().time()
+    now_ts_time = asyncio.get_event_loop().time()
+
+    # Check computation cache (not run_id — always generate a fresh run_id)
+    cached_computation = None
     if cache_key in _SIMILARITY_CACHE:
         cached_at, cached_payload = _SIMILARITY_CACHE[cache_key]
-        if now_ts - cached_at < _CACHE_TTL_SECONDS:
-            return cached_payload
+        if now_ts_time - cached_at < _CACHE_TTL_SECONDS:
+            cached_computation = cached_payload
+
+    if cached_computation and "error" not in cached_computation:
+        # Reuse the cached computation, but create a NEW run_id + persist
+        # a NEW immutable SimilarityRun row.
+        result = dict(cached_computation)  # shallow copy
+        run_id = new_run_id()
+        result["similarity_run_id"] = run_id
+        result["technical_decision"] = technical_decision
+        result["technical_score"] = technical_score
+        # Recompute historical_alignment if the technical_decision changed
+        if technical_decision and result.get("statistics"):
+            stats_agg = StatisticsAggregator()
+            from app.services.learning.statistics import HorizonStatistics, DirectionRate
+            # alignment from the cached stats
+            stats_dict = result["statistics"]
+            if stats_dict and stats_dict.get("sample_size", 0) > 0:
+                # Reconstruct HorizonStatistics for alignment computation
+                hs = HorizonStatistics(
+                    horizon_minutes=stats_dict["horizon_minutes"],
+                    sample_size=stats_dict["sample_size"],
+                    up_count=stats_dict["up_count"],
+                    down_count=stats_dict["down_count"],
+                    neutral_count=stats_dict["neutral_count"],
+                    up_rate=DirectionRate(stats_dict["up_rate"]["count"], stats_dict["up_rate"]["rate"],
+                                          stats_dict["up_rate"]["wilson_lower"], stats_dict["up_rate"]["wilson_upper"]),
+                    down_rate=DirectionRate(stats_dict["down_rate"]["count"], stats_dict["down_rate"]["rate"],
+                                            stats_dict["down_rate"]["wilson_lower"], stats_dict["down_rate"]["wilson_upper"]),
+                    neutral_rate=DirectionRate(stats_dict["neutral_rate"]["count"], stats_dict["neutral_rate"]["rate"],
+                                               stats_dict["neutral_rate"]["wilson_lower"], stats_dict["neutral_rate"]["wilson_upper"]),
+                    median_return=stats_dict.get("median_return"),
+                    mean_return=stats_dict.get("mean_return"),
+                    median_mfe=stats_dict.get("median_mfe"),
+                    median_mae=stats_dict.get("median_mae"),
+                    mean_mfe=stats_dict.get("mean_mfe"),
+                    mean_mae=stats_dict.get("mean_mae"),
+                    return_25th=stats_dict.get("return_25th"),
+                    return_50th=stats_dict.get("return_50th"),
+                    return_75th=stats_dict.get("return_75th"),
+                    sample_quality=stats_dict.get("sample_quality", "INSUFFICIENT"),
+                )
+                result["historical_alignment"] = stats_agg.alignment_for_decision(technical_decision, hs)
+        # Persist a NEW immutable SimilarityRun row with the fresh run_id
+        _persist_similarity_run(result, cfg, run_id)
+        return result
+
+    # Full computation path (cache miss)
 
     builder = HistoricalStateBuilder(base_timeframe=cfg.base_timeframe, min_history=cfg.min_history_candles)
     engine = SimilarityEngine(config=cfg)
     stats_agg = StatisticsAggregator()
 
-    # Build current feature vector — pre-fetch H1/H4/D1 ONCE.
+    # Pre-fetch H1/H4/D1 ONCE
     all_h1 = await get_candles(cfg.base_timeframe, 5000, "XAU/USD")
     all_h4 = await get_candles("4h", 5000, "XAU/USD")
     all_d1 = await get_candles("1day", 5000, "XAU/USD")
@@ -398,12 +549,13 @@ async def current_similarity(
             select(HistoricalMarketState).where(
                 HistoricalMarketState.instrument == instrument,
                 HistoricalMarketState.base_timeframe == cfg.base_timeframe,
+                HistoricalMarketState.feature_version == cfg.feature_version,
+                HistoricalMarketState.possible_contract_roll.is_(False),  # exclude rolls from learning
             ).order_by(HistoricalMarketState.timestamp.asc())
         ).all()
 
     candidates: list[tuple[int, datetime, FeatureVector]] = []
     for row in candidate_rows:
-        # Reconstruct FeatureVector from the stored row.
         fv = FeatureVector(
             rsi_normalized=row.rsi / 100.0 if row.rsi is not None else None,
             ema_distance_atr=None,
@@ -430,8 +582,14 @@ async def current_similarity(
         min_spacing_seconds=min_spacing_seconds,
         top_k=cfg.top_k,
     )
+    raw_neighbor_count = len(ranked)
+
+    # Phase 4.1: minimum_similarity_score — drop matches below threshold
+    # (sample_size can be LOWER than top_k — insufficient data wins).
+    ranked = [r for r in ranked if r[1] >= cfg.minimum_similarity_score]
 
     # Fetch outcomes at the requested horizon for each kept neighbor
+    # (only VALID + NON-EXCLUDED outcomes contribute to stats).
     neighbor_state_ids = [r[0] for r in ranked]
     outcomes_by_state_id: dict[int, dict] = {}
     if neighbor_state_ids:
@@ -440,6 +598,8 @@ async def current_similarity(
                 select(HistoricalOutcome).where(
                     HistoricalOutcome.state_id.in_(neighbor_state_ids),
                     HistoricalOutcome.horizon_minutes == horizon_minutes,
+                    HistoricalOutcome.excluded_from_learning.is_(False),
+                    HistoricalOutcome.horizon_valid.is_(True),
                 )
             ).all()
             for o in outcome_rows:
@@ -453,6 +613,21 @@ async def current_similarity(
         outcome_row = outcomes_by_state_id.get(state_id, {}).get(horizon_minutes)
         if outcome_row is None:
             continue
+        # Phase 4.1: directional MFE/MAE — depends on technical_decision
+        directional_mfe = None
+        directional_mae = None
+        if outcome_row.max_up_move is not None and outcome_row.max_down_move is not None:
+            if technical_decision == "BUY":
+                directional_mfe = outcome_row.max_up_move
+                directional_mae = abs(outcome_row.max_down_move)
+            elif technical_decision == "SELL":
+                directional_mfe = abs(outcome_row.max_down_move)
+                directional_mae = outcome_row.max_up_move
+            else:
+                # WAIT / NO_DECISION — direction-neutral
+                directional_mfe = outcome_row.max_up_move
+                directional_mae = outcome_row.max_down_move
+
         neighbors.append(NeighborMatch(
             state_id=state_id,
             timestamp=ts,
@@ -461,8 +636,8 @@ async def current_similarity(
             feature_vector=fv,
             outcome_direction=outcome_row.direction,
             outcome_future_price=outcome_row.future_price,
-            outcome_mfe=outcome_row.mfe,
-            outcome_mae=outcome_row.mae,
+            outcome_mfe=directional_mfe,        # Phase 4.1: directional
+            outcome_mae=directional_mae,         # Phase 4.1: directional
             outcome_percentage_change=outcome_row.percentage_change,
         ))
         if outcome_row.direction and outcome_row.direction != "NULL":
@@ -472,10 +647,10 @@ async def current_similarity(
                     future_price=outcome_row.future_price,
                     absolute_change=outcome_row.absolute_change,
                     percentage_change=outcome_row.percentage_change,
-                    mfe=outcome_row.mfe,
-                    mae=outcome_row.mae,
-                    maximum_up_move=outcome_row.maximum_up_move,
-                    maximum_down_move=outcome_row.maximum_down_move,
+                    mfe=directional_mfe,
+                    mae=directional_mae,
+                    maximum_up_move=outcome_row.max_up_move,
+                    maximum_down_move=outcome_row.max_down_move,
                     direction=outcome_row.direction,
                 )
             })
@@ -487,15 +662,63 @@ async def current_similarity(
     if horizon_stats and technical_decision:
         alignment = stats_agg.alignment_for_decision(technical_decision, horizon_stats)
 
+    # Phase 4.1: similarity distribution (highest / median / lowest / 25 / 75)
+    similarities = [n.similarity_score for n in neighbors] if neighbors else []
+    highest_sim = max(similarities) if similarities else None
+    lowest_sim = min(similarities) if similarities else None
+    median_sim = round(py_median(similarities), 4) if similarities else None
+    sim_25th = round(percentile(similarities, 25), 4) if similarities else None
+    sim_75th = round(percentile(similarities, 75), 4) if similarities else None
+
+    # Phase 4.1: effective history (exact, not "5.5d or 2y")
+    feature_history_start = min((r[2] for r in ranked), default=None) if ranked else None
+    feature_history_end = max((r[2] for r in ranked), default=None) if ranked else None
+    outcome_history_start: datetime | None = None
+    outcome_history_end: datetime | None = None
+    if neighbors:
+        outcome_history_start = min(n.timestamp for n in neighbors)
+        outcome_history_end = max(n.timestamp for n in neighbors)
+    if feature_history_start and outcome_history_start:
+        effective_start = max(feature_history_start, outcome_history_start)
+    else:
+        effective_start = feature_history_start or outcome_history_start
+    if feature_history_end and outcome_history_end:
+        effective_end = min(feature_history_end, outcome_history_end)
+    else:
+        effective_end = feature_history_end or outcome_history_end
+    effective_days = None
+    if effective_start and effective_end:
+        effective_days = round((effective_end - effective_start).total_seconds() / 86400.0, 2)
+
+    # Top-match IDs (first 50 for the snapshot — full list queryable via the API)
+    top_match_ids = [n.state_id for n in neighbors[:50]]
+
+    # Phase 4.1: persist a NEW immutable SimilarityRun row
+    run_id = new_run_id()
+    run_created_at = datetime.now(timezone.utc)
+    stats_dict = _horizon_stats_to_dict(horizon_stats) if horizon_stats else None
     result = {
+        "similarity_run_id": run_id,
         "instrument": instrument,
+        "analogue_instrument": instrument,  # for now, same as live; future phases may differ
         "feature_version": cfg.feature_version,
         "similarity_version": cfg.similarity_version,
         "horizon_minutes": horizon_minutes,
         "candidate_count": len(candidates),
-        "sample_size": horizon_stats.sample_size if horizon_stats else 0,
-        "current_state_timestamp": current_ts.isoformat(),
-        "current_state_price": latest_candle.close,
+        "raw_neighbor_count": raw_neighbor_count,
+        "independent_neighbor_count": len(neighbors),  # after temporal dedup + threshold filter
+        "sample_size": len(neighbors),
+        "minimum_spacing_seconds": min_spacing_seconds,
+        "similarity_threshold": cfg.minimum_similarity_score,
+        "current_market_timestamp": current_ts.isoformat(),
+        "current_market_price": latest_candle.close,
+        "technical_decision": technical_decision,
+        "technical_score": technical_score,
+        "highest_similarity": highest_sim,
+        "median_selected_similarity": median_sim,
+        "lowest_selected_similarity": lowest_sim,
+        "similarity_25th_percentile": sim_25th,
+        "similarity_75th_percentile": sim_75th,
         "neighbors": [
             {
                 "state_id": n.state_id,
@@ -504,8 +727,8 @@ async def current_similarity(
                 "similarity_score": n.similarity_score,
                 "outcome_direction": n.outcome_direction,
                 "outcome_future_price": n.outcome_future_price,
-                "outcome_mfe": n.outcome_mfe,
-                "outcome_mae": n.outcome_mae,
+                "outcome_mfe": n.outcome_mfe,           # Phase 4.1: directional
+                "outcome_mae": n.outcome_mae,           # Phase 4.1: directional
                 "outcome_percentage_change": n.outcome_percentage_change,
                 "feature_snapshot": {
                     "trend": n.feature_vector.trend,
@@ -525,38 +748,91 @@ async def current_similarity(
             }
             for n in neighbors[:10]
         ],
-        "statistics": _horizon_stats_to_dict(horizon_stats) if horizon_stats else None,
+        "statistics": stats_dict,
         "historical_alignment": alignment,
-        "technical_decision": technical_decision,
-        "probability_calibrated": False,  # Phase 4 invariant — always False
+        "probability_calibrated": False,  # Phase 4.1 invariant — always False
+        "effective_history": {
+            "feature_history_start": feature_history_start.isoformat() if feature_history_start else None,
+            "feature_history_end": feature_history_end.isoformat() if feature_history_end else None,
+            "outcome_history_start": outcome_history_start.isoformat() if outcome_history_start else None,
+            "outcome_history_end": outcome_history_end.isoformat() if outcome_history_end else None,
+            "effective_history_start": effective_start.isoformat() if effective_start else None,
+            "effective_history_end": effective_end.isoformat() if effective_end else None,
+            "effective_days": effective_days,
+        },
         "interpretation_note": (
-            f"Among {horizon_stats.sample_size if horizon_stats else 0} similar {instrument} "
-            f"historical states, the observed directional frequencies are descriptive statistics — "
+            f"Among {len(neighbors)} similar {instrument} historical states, "
+            "the observed directional frequencies are descriptive statistics — "
             "they are NOT calibrated probabilities of future outcomes."
         ),
     }
 
-    # Audit-log the run (best-effort)
+    # Persist immutable SimilarityRun row
+    _persist_similarity_run(result, cfg, run_id)
+
+    # Cache the computation (without the run_id — each call generates fresh)
+    cached_result = dict(result)
+    cached_result.pop("similarity_run_id", None)
+    _SIMILARITY_CACHE[cache_key] = (now_ts_time, cached_result)
+    return result
+
+
+def _persist_similarity_run(result: dict, cfg: LearningConfig, run_id: str) -> None:
+    """Persist a NEW immutable SimilarityRun row. Best-effort — never breaks the API."""
     try:
+        eff = result.get("effective_history", {})
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc).replace(tzinfo=None)
+
+        def _to_naive(ts_str):
+            if not ts_str:
+                return None
+            try:
+                return _dt.fromisoformat(ts_str).replace(tzinfo=None)
+            except (ValueError, TypeError):
+                return None
+
+        stats_dict = result.get("statistics")
+        top_ids = [n["state_id"] for n in result.get("neighbors", [])][:50]
+
         with SessionLocal() as session:
             session.add(SimilarityRun(
-                timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
-                instrument=instrument,
+                run_id=run_id,
+                created_at=now,
+                current_market_timestamp=_to_naive(result.get("current_market_timestamp")),
+                current_market_price=result.get("current_market_price"),
+                instrument=result.get("instrument", "GC_FRONT_MONTH"),
+                analogue_instrument=result.get("analogue_instrument", "GC_FRONT_MONTH"),
                 feature_version=cfg.feature_version,
                 similarity_version=cfg.similarity_version,
-                horizon_minutes=horizon_minutes,
-                candidate_count=len(candidates),
-                sample_size=horizon_stats.sample_size if horizon_stats else 0,
-                result_statistics_json=json.dumps(result.get("statistics") or {}),
-                technical_decision=technical_decision,
-                historical_alignment=alignment,
+                horizon_minutes=result.get("horizon_minutes", 60),
+                technical_decision=result.get("technical_decision"),
+                technical_score=result.get("technical_score"),
+                candidate_count=result.get("candidate_count", 0),
+                raw_neighbor_count=result.get("raw_neighbor_count", 0),
+                independent_neighbor_count=result.get("independent_neighbor_count", 0),
+                minimum_spacing_seconds=result.get("minimum_spacing_seconds", 0),
+                similarity_threshold=result.get("similarity_threshold", 0.5),
+                highest_similarity=result.get("highest_similarity"),
+                median_selected_similarity=result.get("median_selected_similarity"),
+                lowest_selected_similarity=result.get("lowest_selected_similarity"),
+                similarity_25th_percentile=result.get("similarity_25th_percentile"),
+                similarity_75th_percentile=result.get("similarity_75th_percentile"),
+                top_match_ids=json.dumps(top_ids),
+                statistics_json=json.dumps(stats_dict or {}),
+                historical_alignment=result.get("historical_alignment"),
+                feature_history_start=_to_naive(eff.get("feature_history_start")),
+                feature_history_end=_to_naive(eff.get("feature_history_end")),
+                outcome_history_start=_to_naive(eff.get("outcome_history_start")),
+                outcome_history_end=_to_naive(eff.get("outcome_history_end")),
+                effective_history_start=_to_naive(eff.get("effective_history_start")),
+                effective_history_end=_to_naive(eff.get("effective_history_end")),
+                effective_days=eff.get("effective_days"),
+                probability_calibrated=False,
             ))
             session.commit()
     except Exception:
-        pass
-
-    _SIMILARITY_CACHE[cache_key] = (now_ts, result)
-    return result
+        pass  # audit log is best-effort — never break the API
 
 
 def _horizon_stats_to_dict(stats) -> dict:
@@ -597,6 +873,126 @@ def _horizon_stats_to_dict(stats) -> dict:
     }
 
 
+# ===========================================================================
+# State + Run inspectors
+# ===========================================================================
+
+def get_state(state_id: int) -> dict | None:
+    """GET /api/learning/states/{id} — full feature snapshot + outcome availability."""
+    with SessionLocal() as session:
+        state = session.scalar(
+            select(HistoricalMarketState).where(HistoricalMarketState.id == state_id)
+        )
+        if state is None:
+            return None
+        outcomes = session.scalars(
+            select(HistoricalOutcome).where(HistoricalOutcome.state_id == state_id)
+        ).all()
+    return {
+        "state_id": state.id,
+        "instrument": state.instrument,
+        "provider": state.provider,
+        "provider_symbol": state.provider_symbol,
+        "timestamp": state.timestamp.isoformat() if state.timestamp else None,
+        "base_timeframe": state.base_timeframe,
+        "price": state.price,
+        "raw_features": {
+            "ema_fast": state.ema_fast, "ema_slow": state.ema_slow,
+            "ema_distance_pct": state.ema_distance_pct,
+            "rsi": state.rsi, "atr": state.atr, "atr_pct": state.atr_pct,
+            "trend": state.trend, "market_regime": state.market_regime,
+            "distance_to_support_atr": state.distance_to_support_atr,
+            "distance_to_resistance_atr": state.distance_to_resistance_atr,
+            "swing_structure": state.swing_structure,
+            "volatility_percentile": state.volatility_percentile,
+            "session": state.session,
+            "h1_direction": state.h1_direction, "h4_direction": state.h4_direction, "d1_direction": state.d1_direction,
+            "timeframe_alignment_score": state.timeframe_alignment_score,
+        },
+        "normalized_vector": {
+            "rsi_normalized": state.rsi / 100.0 if state.rsi is not None else None,
+            "atr_pct": state.atr_pct,
+            "distance_to_support_atr": state.distance_to_support_atr,
+            "distance_to_resistance_atr": state.distance_to_resistance_atr,
+            "volatility_percentile": state.volatility_percentile,
+            "timeframe_alignment_score": state.timeframe_alignment_score,
+        },
+        "source_quality": state.source_quality,
+        "possible_contract_roll": state.possible_contract_roll,
+        "roll_gap_size": state.roll_gap_size,
+        "roll_detection_reason": state.roll_detection_reason,
+        "feature_version": state.feature_version,
+        "similarity_version": state.similarity_version,
+        "created_at": state.created_at.isoformat() if state.created_at else None,
+        "outcome_availability": [
+            {
+                "horizon_minutes": o.horizon_minutes,
+                "direction": o.direction,
+                "future_price": o.future_price,
+                "max_up_move": o.max_up_move,
+                "max_down_move": o.max_down_move,
+                "horizon_valid": o.horizon_valid,
+                "actual_elapsed_seconds": o.actual_elapsed_seconds,
+                "excluded_from_learning": o.excluded_from_learning,
+                "exclusion_reason": o.exclusion_reason,
+                "possible_contract_roll": o.possible_contract_roll,
+            }
+            for o in outcomes
+        ],
+    }
+
+
+def get_run(run_id: str) -> dict | None:
+    """GET /api/learning/runs/{run_id} — full immutable run snapshot."""
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(SimilarityRun).where(SimilarityRun.run_id == run_id)
+        )
+        if run is None:
+            return None
+    import json as _json
+    return {
+        "run_id": run.run_id,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "current_market_timestamp": run.current_market_timestamp.isoformat() if run.current_market_timestamp else None,
+        "current_market_price": run.current_market_price,
+        "instrument": run.instrument,
+        "analogue_instrument": run.analogue_instrument,
+        "feature_version": run.feature_version,
+        "similarity_version": run.similarity_version,
+        "horizon_minutes": run.horizon_minutes,
+        "technical_decision": run.technical_decision,
+        "technical_score": run.technical_score,
+        "candidate_count": run.candidate_count,
+        "raw_neighbor_count": run.raw_neighbor_count,
+        "independent_neighbor_count": run.independent_neighbor_count,
+        "minimum_spacing_seconds": run.minimum_spacing_seconds,
+        "similarity_threshold": run.similarity_threshold,
+        "highest_similarity": run.highest_similarity,
+        "median_selected_similarity": run.median_selected_similarity,
+        "lowest_selected_similarity": run.lowest_selected_similarity,
+        "similarity_25th_percentile": run.similarity_25th_percentile,
+        "similarity_75th_percentile": run.similarity_75th_percentile,
+        "top_match_ids": _json.loads(run.top_match_ids) if run.top_match_ids else [],
+        "statistics": _json.loads(run.statistics_json) if run.statistics_json else {},
+        "historical_alignment": run.historical_alignment,
+        "effective_history": {
+            "feature_history_start": run.feature_history_start.isoformat() if run.feature_history_start else None,
+            "feature_history_end": run.feature_history_end.isoformat() if run.feature_history_end else None,
+            "outcome_history_start": run.outcome_history_start.isoformat() if run.outcome_history_start else None,
+            "outcome_history_end": run.outcome_history_end.isoformat() if run.outcome_history_end else None,
+            "effective_history_start": run.effective_history_start.isoformat() if run.effective_history_start else None,
+            "effective_history_end": run.effective_history_end.isoformat() if run.effective_history_end else None,
+            "effective_days": run.effective_days,
+        },
+        "probability_calibrated": run.probability_calibrated,
+    }
+
+
+# ===========================================================================
+# Status endpoint
+# ===========================================================================
+
 async def learning_status() -> dict:
     """Top-level /api/learning/status payload."""
     with SessionLocal() as session:
@@ -625,10 +1021,16 @@ async def learning_status() -> dict:
                 HistoricalOutcome.horizon_minutes,
                 func.count(HistoricalOutcome.id),
                 func.sum(func.iif(HistoricalOutcome.direction != "NULL", 1, 0)),
+                func.sum(func.iif(HistoricalOutcome.excluded_from_learning, 1, 0)),
             ).group_by(HistoricalOutcome.horizon_minutes)
         ).all()
         recent_runs = session.scalars(
-            select(SimilarityRun).order_by(SimilarityRun.timestamp.desc()).limit(10)
+            select(SimilarityRun).order_by(SimilarityRun.created_at.desc()).limit(10)
+        ).all()
+        active_jobs_rows = session.scalars(
+            select(BuildJob).where(
+                BuildJob.status.in_(["queued", "running", "interrupted", "paused"])
+            ).order_by(BuildJob.started_at.desc())
         ).all()
 
     return {
@@ -646,26 +1048,61 @@ async def learning_status() -> dict:
                 "horizon_minutes": h,
                 "total_outcomes": total,
                 "valid_outcomes": valid if valid is not None else 0,
+                "excluded_outcomes": excluded if excluded is not None else 0,
             }
-            for h, total, valid in by_horizon
+            for h, total, valid, excluded in by_horizon
         ],
         "recent_runs": [
             {
-                "id": r.id,
-                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "run_id": r.run_id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
                 "instrument": r.instrument,
+                "analogue_instrument": r.analogue_instrument,
                 "feature_version": r.feature_version,
                 "similarity_version": r.similarity_version,
                 "horizon_minutes": r.horizon_minutes,
                 "candidate_count": r.candidate_count,
-                "sample_size": r.sample_size,
+                "independent_neighbor_count": r.independent_neighbor_count,
+                "raw_neighbor_count": r.raw_neighbor_count,
                 "technical_decision": r.technical_decision,
+                "technical_score": r.technical_score,
                 "historical_alignment": r.historical_alignment,
+                "highest_similarity": r.highest_similarity,
+                "median_selected_similarity": r.median_selected_similarity,
+                "lowest_similarity": r.lowest_selected_similarity,
+                "effective_days": r.effective_days,
             }
             for r in recent_runs
         ],
+        "active_jobs": [get_job(r.job_id) or {} for r in active_jobs_rows],
         "feature_version": DEFAULT_CONFIG.feature_version,
         "similarity_version": DEFAULT_CONFIG.similarity_version,
         "probability_calibrated": False,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ===========================================================================
+# Legacy sync build_states (still callable, but spawns background job)
+# ===========================================================================
+
+async def build_states(
+    *,
+    instrument: str = "GC_FRONT_MONTH",
+    base_timeframe: str = "1h",
+    config: LearningConfig | None = None,
+    batch_limit: int = 5000,
+    clear_existing: bool = False,
+) -> dict:
+    """Phase 4.1: legacy entry point. Spawns a background build job and
+    returns immediately with job_id. The HTTP request NEVER blocks.
+
+    Kept for backward compat with Phase 4 callers; new code should call
+    start_build_job() directly.
+    """
+    return start_build_job(
+        instrument=instrument,
+        base_timeframe=base_timeframe,
+        config=config,
+        clear_existing=clear_existing,
+    )

@@ -231,11 +231,15 @@ class HistoricalMarketState(Base):
 
     feature_version + similarity_version persist the versioning so we
     can rebuild cleanly when feature engineering changes.
+
+    Phase 4.1: possible_contract_roll flags states near a detected
+    contract-roll discontinuity. Roll-boundary states are EXCLUDED
+    from learning by default (not deleted — preserved for audit).
     """
 
     __tablename__ = "historical_market_states"
     __table_args__ = (
-        UniqueConstraint("instrument", "base_timeframe", "timestamp", name="uq_hist_state_inst_tf_ts"),
+        UniqueConstraint("instrument", "base_timeframe", "timestamp", "feature_version", name="uq_hist_state_inst_tf_ts_fv"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -249,10 +253,10 @@ class HistoricalMarketState(Base):
     # Normalized continuous features
     ema_fast: Mapped[float | None] = mapped_column(Float, nullable=True)
     ema_slow: Mapped[float | None] = mapped_column(Float, nullable=True)
-    ema_distance_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # (fast-slow)/slow * 100
-    rsi: Mapped[float | None] = mapped_column(Float, nullable=True)               # 0..100
+    ema_distance_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rsi: Mapped[float | None] = mapped_column(Float, nullable=True)
     atr: Mapped[float | None] = mapped_column(Float, nullable=True)
-    atr_pct: Mapped[float | None] = mapped_column(Float, nullable=True)            # atr / price * 100
+    atr_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Categorical features (stored as strings for inspection)
     trend: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -263,7 +267,7 @@ class HistoricalMarketState(Base):
     distance_to_resistance_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Swing structure classification
-    swing_structure: Mapped[str | None] = mapped_column(String(32), nullable=True)  # HH_HL / LH_LL / etc.
+    swing_structure: Mapped[str | None] = mapped_column(String(32), nullable=True)
     higher_high: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     higher_low: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     lower_high: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -271,19 +275,24 @@ class HistoricalMarketState(Base):
 
     # Volatility context (0-100 percentile rank within recent history)
     volatility_percentile: Mapped[float | None] = mapped_column(Float, nullable=True)
-    session: Mapped[str | None] = mapped_column(String(16), nullable=True)  # ASIA / EU / US / OFF
+    session: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Multi-timeframe direction (computed from each TF's trend at T)
     h1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
     h4_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
     d1_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    timeframe_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0..1
+    timeframe_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Source quality: HEALTHY / DEGRADED / INVALID based on data around T
     source_quality: Mapped[str] = mapped_column(String(16), default="HEALTHY")
 
+    # Phase 4.1: roll-boundary detection metadata
+    possible_contract_roll: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    roll_gap_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    roll_detection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     # Versioning — mandatory so we can rebuild when feature engineering changes
-    feature_version: Mapped[str] = mapped_column(String(16), default="features-v0.1")
+    feature_version: Mapped[str] = mapped_column(String(16), default="features-v0.1", index=True)
     similarity_version: Mapped[str] = mapped_column(String(16), default="similarity-v0.1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -291,12 +300,18 @@ class HistoricalMarketState(Base):
 class HistoricalOutcome(Base):
     """Phase 4: outcome window for a historical state at one horizon.
 
-    Computed strictly from candles with timestamp >= state.timestamp.
-    NEVER used to influence the feature vector at the state's own time
-    (would be look-ahead leakage).
-
-    direction is UP / DOWN / NEUTRAL based on a volatility-aware
-    threshold (X * ATR). X is configurable; default X = 0.5 (conservative).
+    Phase 4.1 changes:
+      - max_up_move and max_down_move are now the CANONICAL stored fields
+        (neutral market excursions — the state itself does NOT represent
+        BUY or SELL). Directional MFE/MAE is computed at query time:
+          BUY  query: MFE = max_up_move,        MAE = abs(max_down_move)
+          SELL query: MFE = abs(max_down_move), MAE = max_up_move
+      - horizon_valid: True only if the forward window contains sufficient
+        valid market observations (no excessive market closures). Friday
+        20:30 + 4h must NOT silently use Sunday/Monday pricing.
+      - possible_contract_roll + excluded_from_learning: outcomes crossing
+        a suspected roll boundary are flagged and excluded from stats by
+        default (preserved for audit).
     """
 
     __tablename__ = "historical_outcomes"
@@ -310,31 +325,109 @@ class HistoricalOutcome(Base):
     future_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     absolute_change: Mapped[float | None] = mapped_column(Float, nullable=True)
     percentage_change: Mapped[float | None] = mapped_column(Float, nullable=True)
-    mfe: Mapped[float | None] = mapped_column(Float, nullable=True)  # max favorable excursion
-    mae: Mapped[float | None] = mapped_column(Float, nullable=True)  # max adverse excursion
-    maximum_up_move: Mapped[float | None] = mapped_column(Float, nullable=True)
-    maximum_down_move: Mapped[float | None] = mapped_column(Float, nullable=True)
-    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)  # UP / DOWN / NEUTRAL / NULL
+    # Canonical neutral excursions (Phase 4.1)
+    max_up_move: Mapped[float | None] = mapped_column(Float, nullable=True)  # max(high) - entry_price (>= 0)
+    max_down_move: Mapped[float | None] = mapped_column(Float, nullable=True)  # entry_price - min(low) (>= 0)
+    # Legacy MFE/MAE fields — kept for backward compat but recomputed
+    # from max_up_move/max_down_move at query time based on direction.
+    mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Phase 4.1: window validity + roll-boundary + exclusion metadata
+    horizon_valid: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    actual_elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    possible_contract_roll: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    roll_gap_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    excluded_from_learning: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class SimilarityRun(Base):
-    """Phase 4: audit log of every live similarity run.
+    """Phase 4 + 4.1: immutable audit record of every live similarity run.
 
-    Lets us later evaluate whether historical similarity actually helps —
-    by comparing technical decisions against historical evidence over time.
+    Phase 4.1: every similarity calculation now persists a full immutable
+    snapshot. Given a run_id, all stats (sample / counts / rates / Wilson
+    intervals / median return / MFE / MAE / top analogues) MUST remain
+    byte-for-byte identical. New market state → new run, never update old.
     """
 
     __tablename__ = "similarity_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    instrument: Mapped[str] = mapped_column(String(32), index=True)
+    run_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # "SIM-<uuid8>"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    current_market_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    current_market_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True)             # live instrument
+    analogue_instrument: Mapped[str] = mapped_column(String(32), index=True)    # instrument stats came from
     feature_version: Mapped[str] = mapped_column(String(16))
     similarity_version: Mapped[str] = mapped_column(String(16))
-    horizon_minutes: Mapped[int] = mapped_column(Integer)
-    candidate_count: Mapped[int] = mapped_column(Integer)
-    sample_size: Mapped[int] = mapped_column(Integer)
-    result_statistics_json: Mapped[str] = mapped_column(Text)        # JSON: up_rate, down_rate, neutral_rate, etc.
+    horizon_minutes: Mapped[int] = mapped_column(Integer, index=True)
     technical_decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    historical_alignment: Mapped[str | None] = mapped_column(String(32), nullable=True)  # SUPPORTS/CONTRADICTS/NEUTRAL/INSUFFICIENT_DATA
+    technical_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    candidate_count: Mapped[int] = mapped_column(Integer)                       # total candidates considered
+    raw_neighbor_count: Mapped[int] = mapped_column(Integer)                    # top-K before temporal dedup
+    independent_neighbor_count: Mapped[int] = mapped_column(Integer)            # after temporal dedup (= sample_size)
+    minimum_spacing_seconds: Mapped[int] = mapped_column(Integer)               # dedup spacing used
+    similarity_threshold: Mapped[float] = mapped_column(Float)                   # minimum_similarity_score config
+
+    highest_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_selected_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lowest_selected_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    similarity_25th_percentile: Mapped[float | None] = mapped_column(Float, nullable=True)
+    similarity_75th_percentile: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    top_match_ids: Mapped[str] = mapped_column(Text)                            # JSON list of state_ids
+    statistics_json: Mapped[str] = mapped_column(Text)                          # full immutable stats snapshot
+    historical_alignment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Effective history per horizon (exact — not "5.5d or 2y")
+    feature_history_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    feature_history_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_history_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_history_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_history_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_history_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_days: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    probability_calibrated: Mapped[bool] = mapped_column(Boolean, default=False)  # ALWAYS False in Phase 4.1
+
+
+class BuildJob(Base):
+    """Phase 4.1: background build job tracker.
+
+    POST /api/learning/build-states creates a BuildJob row + spawns an
+    asyncio task. The task periodically updates built/remaining/
+    percent_complete/updated_at. Resumable: on backend restart, jobs
+    left in "running" state are marked "interrupted" and can be resumed
+    by POSTing the same job_id with resume=true.
+    """
+
+    __tablename__ = "build_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # "JOB-<uuid8>"
+    instrument: Mapped[str] = mapped_column(String(32), index=True)
+    base_timeframe: Mapped[str] = mapped_column(String(16))
+    feature_version: Mapped[str] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)  # queued/running/paused/completed/failed/interrupted
+    eligible_total: Mapped[int] = mapped_column(Integer, default=0)
+    built: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_existing: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_roll: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_gaps: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_insufficient_future: Mapped[int] = mapped_column(Integer, default=0)
+    remaining: Mapped[int] = mapped_column(Integer, default=0)
+    percent_complete: Mapped[float] = mapped_column(Float, default=0.0)
+    last_checkpoint_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    earliest_state: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    latest_state: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    states_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)

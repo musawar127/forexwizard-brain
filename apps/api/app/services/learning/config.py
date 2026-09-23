@@ -86,6 +86,22 @@ class LearningConfig:
     # How many candles of history must exist before T to compute a state.
     # Needs >=20 for slow EMA + RSI + ATR + percentile rank.
     min_history_candles: int = 30
+    # Phase 4.1: minimum_similarity_score — matches below this score are
+    # NOT included merely to reach top-K. So sample_size can be LOWER
+    # than top_k. Insufficient data must win.
+    minimum_similarity_score: float = 0.50
+    # Phase 4.1: roll-boundary detection — if the absolute gap between
+    # consecutive H1 candles (|close[i] - open[i+1]| / ATR) exceeds this
+    # multiple of ATR, mark the state as possible_contract_roll.
+    roll_atr_multiple: float = 5.0  # 5x ATR — conservative (real rolls are 5-30x ATR)
+    # Phase 4.1: outcome window validity — if the actual elapsed time
+    # between state timestamp and the last candle in the forward window
+    # exceeds expected_elapsed * max_elapsed_multiple, mark horizon_valid=False.
+    max_elapsed_multiple: float = 2.0  # 2x expected — covers small closures, rejects weekends
+    # Phase 4.1: build batching — commit every N states.
+    build_batch_size: int = 25
+    # Phase 4.1: build checkpoint interval — update job progress every N states.
+    build_checkpoint_interval: int = 50
 
 
 # Singleton default config — use LearningConfig() to override per-call.
