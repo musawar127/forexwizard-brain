@@ -1,0 +1,6 @@
+"use client";
+import { useEffect,useState } from "react";
+import { API } from "@/lib/api";
+
+type Pred={id:number;timestamp:string;decision:string;confidence:number;price:number;regime:string;risk:string;score:number;brain_version:string};
+export default function MemoryPage(){const[items,setItems]=useState<Pred[]>([]);useEffect(()=>{fetch(`${API}/api/memory/predictions?limit=100`,{cache:"no-store"}).then(r=>r.json()).then(x=>setItems(x.items||[])).catch(()=>{})},[]);return <><div className="page-title"><div><span>MEMORY</span><h2>Prediction audit trail</h2></div><p>Every periodic analysis is stored so future outcomes can be measured instead of remembered selectively.</p></div><section className="panel table-panel"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Decision</th><th>Confidence</th><th>Price</th><th>Regime</th><th>Score</th></tr></thead><tbody>{items.map(x=><tr key={x.id}><td>{new Date(x.timestamp).toLocaleString()}</td><td><span className={`table-decision ${x.decision.toLowerCase()}`}>{x.decision}</span></td><td>{x.confidence.toFixed(0)}%</td><td>{x.price.toFixed(2)}</td><td>{x.regime}</td><td>{x.score.toFixed(2)}</td></tr>)}</tbody></table>{!items.length&&<div className="empty-state">Prediction memory will appear after the backend begins collecting market snapshots.</div>}</div></section></>}

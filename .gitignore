@@ -1,0 +1,25 @@
+# secrets
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+apps/api/forexwizard.db
+*.db-shm
+*.db-wal
+
+# Node
+node_modules/
+.next/
+out/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
