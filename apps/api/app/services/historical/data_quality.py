@@ -346,7 +346,7 @@ def _count_invalid_candles(symbol: str, interval: str) -> int:
             text(
                 """
                 SELECT COUNT(*) FROM market_candles
-                WHERE symbol = :sym AND interval = :iv AND is_historical = 1
+                WHERE symbol = :sym AND interval = :iv AND is_historical = TRUE
                   AND (open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
                        OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
                        OR high < low
@@ -373,7 +373,7 @@ def _count_db_duplicates(interval: str, symbol: str) -> int:
                 SELECT COUNT(*) FROM (
                   SELECT symbol, interval, timestamp, COUNT(*) AS c
                   FROM market_candles
-                  WHERE symbol = :sym AND interval = :iv AND is_historical = 1
+                  WHERE symbol = :sym AND interval = :iv AND is_historical = TRUE
                   GROUP BY symbol, interval, timestamp
                   HAVING COUNT(*) > 1
                 )
