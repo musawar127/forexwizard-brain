@@ -994,19 +994,25 @@ def _get_spot_storage_info() -> dict:
     try:
         with SessionLocal() as session:
             from app.db.models import CandleRecord
-            from sqlalchemy import func as sa_func
-            oldest = session.scalar(sa_func.min(CandleRecord.timestamp).where(
-                CandleRecord.instrument == "XAUUSD_SPOT",
-                CandleRecord.interval == "1min",
-            ))
-            latest = session.scalar(sa_func.max(CandleRecord.timestamp).where(
-                CandleRecord.instrument == "XAUUSD_SPOT",
-                CandleRecord.interval == "1min",
-            ))
-            total = session.scalar(sa_func.count(CandleRecord.id).where(
-                CandleRecord.instrument == "XAUUSD_SPOT",
-                CandleRecord.interval == "1min",
-            )) or 0
+            from sqlalchemy import func as sa_func, select as sa_select
+            oldest = session.scalar(
+                sa_select(sa_func.min(CandleRecord.timestamp)).where(
+                    CandleRecord.instrument == "XAUUSD_SPOT",
+                    CandleRecord.interval == "1min",
+                )
+            )
+            latest = session.scalar(
+                sa_select(sa_func.max(CandleRecord.timestamp)).where(
+                    CandleRecord.instrument == "XAUUSD_SPOT",
+                    CandleRecord.interval == "1min",
+                )
+            )
+            total = session.scalar(
+                sa_select(sa_func.count(CandleRecord.id)).where(
+                    CandleRecord.instrument == "XAUUSD_SPOT",
+                    CandleRecord.interval == "1min",
+                )
+            ) or 0
         retention_days = None
         if oldest and latest:
             if oldest.tzinfo is None:
