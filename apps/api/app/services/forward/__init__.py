@@ -30,7 +30,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 
 from app.db.models import (
     ForwardAuditLog,
@@ -582,8 +582,8 @@ def get_forward_status() -> dict:
             select(
                 ForwardOutcome.horizon_minutes,
                 func.count(ForwardOutcome.id),
-                func.sum(func.iif(ForwardOutcome.outcome_status == "VALID", 1, 0)),
-                func.sum(func.iif(ForwardOutcome.outcome_status == "INVALID", 1, 0)),
+                func.sum(case((ForwardOutcome.outcome_status == "VALID", 1), else_=0)),
+                func.sum(case((ForwardOutcome.outcome_status == "INVALID", 1), else_=0)),
             ).group_by(ForwardOutcome.horizon_minutes)
         ).all()
 

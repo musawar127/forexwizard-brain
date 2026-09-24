@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from statistics import median as py_median
 from statistics import quantiles as py_quantiles
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 
 from app.db.models import (
     BuildJob,
@@ -1455,8 +1455,8 @@ async def learning_status() -> dict:
             select(
                 HistoricalOutcome.horizon_minutes,
                 func.count(HistoricalOutcome.id),
-                func.sum(func.iif(HistoricalOutcome.direction != "NULL", 1, 0)),
-                func.sum(func.iif(HistoricalOutcome.excluded_from_learning, 1, 0)),
+                func.sum(case((HistoricalOutcome.direction != "NULL", 1), else_=0)),
+                func.sum(case((HistoricalOutcome.excluded_from_learning, 1), else_=0)),
             ).group_by(HistoricalOutcome.horizon_minutes)
         ).all()
         recent_runs = session.scalars(

@@ -134,9 +134,12 @@ def run_startup_migrations() -> None:
                     # Mark all existing Phase 4 outcomes as horizon_valid=True
                     # (Phase 4 didn't track validity — assume valid by default
                     # for backward compat. New outcomes get explicit checks.)
+                    # Use TRUE/FALSE literals so this works on both SQLite and
+                    # PostgreSQL (SQLite stores booleans as 0/1, Postgres as
+                    # true/false; both accept the SQL TRUE/FALSE keywords).
                     conn.execute(text(
-                        "UPDATE historical_outcomes SET horizon_valid = 1 "
-                        "WHERE horizon_valid IS NULL OR horizon_valid = 0"
+                        "UPDATE historical_outcomes SET horizon_valid = TRUE "
+                        "WHERE horizon_valid IS NULL OR horizon_valid = FALSE"
                     ))
             except Exception as exc:
                 log.warning("migration: outcome backfill failed (non-fatal): %s", exc)
