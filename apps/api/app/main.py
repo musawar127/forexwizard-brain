@@ -42,6 +42,19 @@ from app.services.forward import (
     _record_heartbeat,
     startup_recovery,
 )
+# Phase 5.6: trade_plan module — advisory XAU/USD trade plans downstream of BUY/SELL/WAIT
+from app.services.trade_plan import (
+    PLAN_VERSION as TRADE_PLAN_VERSION,
+    LIFECYCLE_STATES as TRADE_PLAN_LIFECYCLE_STATES,
+    generate_trade_plan,
+    get_current_plan as trade_plan_get_current,
+    list_plans as trade_plan_list,
+    get_plan as trade_plan_get_plan,
+    get_performance as trade_plan_get_performance,
+    calculate_position_size as trade_plan_calc_position_size,
+    evaluate_live_plans as trade_plan_evaluate_live,
+    trade_plan_validation_loop,
+)
 from app.services.catchup import (
     get_catchup_status,
     get_catchup_job,
@@ -85,6 +98,10 @@ async def lifespan(app: FastAPI):
     # Evaluation runs every 5 minutes (evaluates matured horizons).
     forward_task = asyncio.create_task(_forward_validation_loop(stop_event))
 
+    # Phase 5.6: trade-plan forward-validation loop — every 60s evaluates
+    # live plans (entry touch? SL hit? TP1-4 reached? MFE/MAE? expiry?).
+    trade_plan_task = asyncio.create_task(trade_plan_validation_loop(stop_event))
+
     # Phase 5.2: startup recovery for forward validation
     try:
         recovery_result = await startup_recovery()
@@ -123,6 +140,10 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(forward_task, timeout=5)
     except asyncio.TimeoutError:
         forward_task.cancel()
+    try:
+        await asyncio.wait_for(trade_plan_task, timeout=5)
+    except asyncio.TimeoutError:
+        trade_plan_task.cancel()
     engine.dispose()
 
 
@@ -775,6 +796,102 @@ async def api_catchup_resume(job_id: str):
     """Phase 5.3: resume an interrupted catch-up job."""
     result = await run_catchup(resume_job_id=job_id)
     return result
+
+
+# ============================================================
+# Phase 5.6: Trade Plan Engine — advisory XAU/USD trade plans
+# ============================================================
+# These endpoints are DOWNSTREAM of the Brain's BUY/SELL/WAIT decision.
+# The trade_plan module NEVER overrides the Brain's decision. WAIT ->
+# plan_status=NO_TRADE (no invented entries/SL/TP).
+# ============================================================
+
+
+@app.get("/api/trade-plan/current")
+async def api_trade_plan_current():
+    """Return the most recent trade plan (any status, including NO_TRADE).
+
+    If the latest Brain decision was WAIT or NO_DECISION, the plan_status
+    will be NO_TRADE — no entry/SL/TP levels are invented.
+    """
+    return trade_plan_get_current()
+
+
+@app.get("/api/trade-plan/history")
+async def api_trade_plan_history(limit: int = Query(20, ge=1, le=200)):
+    """Return the most recent N plans, newest first."""
+    return trade_plan_list(limit=limit)
+
+
+@app.get("/api/trade-plan/{plan_id}")
+async def api_trade_plan_detail(plan_id: str):
+    """Return one plan + its lifecycle events + its forward-validation outcome."""
+    return trade_plan_get_plan(plan_id=plan_id)
+
+
+class PositionSizeRequest(BaseModel):
+    """Phase 5.6: position-sizing request body.
+
+    The user must explicitly provide account_equity + risk_percent + sl_distance.
+    We never assume any of them. If broker contract spec is not configured
+    via env vars (XAUUSD_CONTRACT_SIZE / XAUUSD_TICK_SIZE / XAUUSD_TICK_VALUE),
+    we return POSITION_SIZE_UNAVAILABLE rather than guessing.
+    """
+    account_equity: float
+    risk_percent: float
+    sl_distance: float
+    instrument: str = "XAU/USD"
+
+
+@app.post("/api/trade-plan/calculate-position-size")
+async def api_trade_plan_position_size(payload: PositionSizeRequest):
+    """Compute lot size from account_equity + risk_percent + SL distance.
+
+    Requires broker XAU/USD contract spec to be configured via env vars
+    (XAUUSD_CONTRACT_SIZE / XAUUSD_TICK_SIZE / XAUUSD_TICK_VALUE).
+    Returns POSITION_SIZE_UNAVAILABLE otherwise.
+    """
+    result = trade_plan_calc_position_size(
+        account_equity=payload.account_equity,
+        risk_percent=payload.risk_percent,
+        sl_distance=payload.sl_distance,
+        instrument=payload.instrument,
+    )
+    return {
+        "status": result.status,
+        "risk_amount": result.risk_amount,
+        "sl_distance": result.sl_distance,
+        "lot_size": result.lot_size,
+        "contract_size": result.contract_size,
+        "tick_size": result.tick_size,
+        "tick_value": result.tick_value,
+        "instrument": result.instrument,
+        "reason": result.reason,
+    }
+
+
+@app.get("/api/trade-plan/performance")
+async def api_trade_plan_performance():
+    """Aggregate performance metrics across all generated plans.
+
+    Reports total_plans, breakdowns by decision/status/lifecycle, and
+    forward-validation outcome summaries (entries touched, TPs reached,
+    SL hits, expired)."""
+    return trade_plan_get_performance()
+
+
+@app.post("/api/trade-plan/generate")
+async def api_trade_plan_generate():
+    """Generate a fresh trade plan from the current Brain analysis.
+
+    The Brain's BUY/SELL/WAIT decision is INPUT — this endpoint never
+    overrides it. WAIT -> plan_status=NO_TRADE.
+
+    Returns the freshly persisted plan (immutable row in trade_plans).
+    """
+    if state.analysis is None:
+        return {"plan": None, "reason": "brain analysis not yet available"}
+    return generate_trade_plan(state.analysis)
 
 
 @app.websocket("/ws/market")

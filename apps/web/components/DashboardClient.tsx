@@ -6,6 +6,7 @@ import { Candles } from "@/components/Candles";
 import { DecisionCard } from "@/components/DecisionCard";
 import { Timeframes } from "@/components/Timeframes";
 import { TopBar } from "@/components/TopBar";
+import { TradePlanCard } from "@/components/TradePlanCard"; // Phase 5.6
 import { getCandles, getSnapshot } from "@/lib/api";
 import type { Candle, Snapshot } from "@/lib/types";
 
@@ -63,6 +64,7 @@ export function DashboardClient() {
         </div>
       </section>
       <DecisionCard brain={brain ?? null} />
+      <TradePlanCard />
     </section>
 
     <section className="content-grid">
