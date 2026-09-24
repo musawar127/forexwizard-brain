@@ -42,6 +42,14 @@ from app.services.forward import (
     _record_heartbeat,
     startup_recovery,
 )
+from app.services.catchup import (
+    get_catchup_status,
+    get_catchup_job,
+    get_system_mode,
+    list_catchup_jobs,
+    run_catchup,
+    startup_catchup,
+)
 from app.services.market_state import collector_loop, refresh_quote_once, state
 from app.services.redis_health import redis_status
 from app.services.research import recent_research
@@ -89,6 +97,21 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         pass  # startup recovery is best-effort
+
+    # Phase 5.3: run startup catch-up (market recovery + missed captures + research)
+    try:
+        catchup_result = await startup_catchup()
+        import logging
+        logging.getLogger("forexwizard").info(
+            "startup: catch-up — mode=%s offline=%ss recovered=%d missed=%d",
+            catchup_result.get("status", "?"),
+            catchup_result.get("offline_duration_seconds", 0),
+            catchup_result.get("recovered_candles", 0),
+            catchup_result.get("missed_captures", 0),
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger("forexwizard").warning("startup: catch-up failed: %s", exc)
 
     yield
     stop_event.set()
@@ -694,6 +717,54 @@ async def api_system_health():
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.3: Wake and catch-up recovery endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/system/status")
+async def api_system_status():
+    """Phase 5.3: system mode + catch-up progress.
+    Returns mode (STARTING/CATCHING_UP/LIVE/DEGRADED/OFFLINE),
+    offline_duration_seconds, started_at, progress_percent."""
+    return get_system_mode()
+
+
+@app.get("/api/catchup/status")
+async def api_catchup_status():
+    """Phase 5.3: catch-up coordinator status with sync states."""
+    return get_catchup_status()
+
+
+@app.get("/api/catchup/jobs")
+async def api_catchup_jobs(limit: int = Query(20, ge=1, le=100)):
+    """Phase 5.3: list recent catch-up jobs."""
+    return {"jobs": list_catchup_jobs(limit=limit)}
+
+
+@app.get("/api/catchup/jobs/{job_id}")
+async def api_catchup_job_detail(job_id: str):
+    """Phase 5.3: single catch-up job detail."""
+    job = get_catchup_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Catch-up job {job_id} not found")
+    return job
+
+
+@app.post("/api/catchup/run")
+async def api_catchup_run():
+    """Phase 5.3: manually trigger a catch-up run. Returns immediately
+    with job_id. Single catch-up protection prevents duplicates."""
+    result = await run_catchup()
+    return result
+
+
+@app.post("/api/catchup/jobs/{job_id}/resume")
+async def api_catchup_resume(job_id: str):
+    """Phase 5.3: resume an interrupted catch-up job."""
+    result = await run_catchup(resume_job_id=job_id)
+    return result
 
 
 @app.websocket("/ws/market")

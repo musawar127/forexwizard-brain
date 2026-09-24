@@ -640,3 +640,76 @@ class ForwardHeartbeat(Base):
     pending_observations: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     uptime_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ===========================================================================
+# Phase 5.3: Wake and catch-up recovery mode
+# ===========================================================================
+
+
+class SystemSyncState(Base):
+    """Phase 5.3: per-component sync state for the catch-up coordinator."""
+
+    __tablename__ = "system_sync_state"
+    __table_args__ = (
+        UniqueConstraint("component", name="uq_sync_state_component"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    component: Mapped[str] = mapped_column(String(64), index=True)
+    # market_history / spot_history / historical_states / forward_outcomes /
+    # research / economic_events / brain_memory
+    last_successful_sync: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempted_sync: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="IDLE")
+    # IDLE / SYNCING / COMPLETE / DEGRADED / FAILED
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CatchupJob(Base):
+    """Phase 5.3: catch-up job tracker for startup recovery."""
+
+    __tablename__ = "catchup_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="QUEUED", index=True)
+    # QUEUED / RUNNING / COMPLETED / COMPLETED_WITH_WARNINGS / FAILED / INTERRUPTED
+
+    offline_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    market_sync_status: Mapped[str] = mapped_column(String(16), default="IDLE")
+    research_sync_status: Mapped[str] = mapped_column(String(16), default="IDLE")
+    forward_outcome_status: Mapped[str] = mapped_column(String(16), default="IDLE")
+    historical_state_status: Mapped[str] = mapped_column(String(16), default="IDLE")
+
+    recovered_market_candles: Mapped[int] = mapped_column(Integer, default=0)
+    recovered_spot_observations: Mapped[int] = mapped_column(Integer, default=0)
+    research_items_added: Mapped[int] = mapped_column(Integer, default=0)
+    forward_outcomes_evaluated: Mapped[int] = mapped_column(Integer, default=0)
+    missed_forward_captures: Mapped[int] = mapped_column(Integer, default=0)
+    historical_states_added: Mapped[int] = mapped_column(Integer, default=0)
+
+    progress_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MissedForwardCapture(Base):
+    """Phase 5.3: record of forward capture events missed while offline.
+
+    These do NOT count as forward observations — they are audit records
+    showing what was missed. Never fabricate retrospective predictions.
+    """
+
+    __tablename__ = "missed_forward_captures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    capture_timeframe: Mapped[str] = mapped_column(String(16))
+    # M15 / H1
+    expected_capture_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    offline_reason: Mapped[str] = mapped_column(String(64), default="SERVER_OFFLINE")
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
