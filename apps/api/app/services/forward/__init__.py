@@ -1021,7 +1021,9 @@ def _get_spot_storage_info() -> dict:
             "retention_days": retention_days,
             "data_gap_warning": retention_days is not None and retention_days < 1.0,
         }
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger("forexwizard").warning("spot_storage query failed: %s", exc, exc_info=True)
         return {"error": "could not query spot storage"}
 
 
