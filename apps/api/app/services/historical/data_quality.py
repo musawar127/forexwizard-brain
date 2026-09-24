@@ -21,9 +21,27 @@ from sqlalchemy import func, select
 
 from app.db.models import CandleRecord, HistoricalSyncState
 from app.db.session import SessionLocal
+from app.core.config import settings
 from app.engine.candles import INTERVALS, get_candles
 from app.services.historical.factory import list_available_providers
 from app.services.historical.validator import find_gaps
+
+
+def _detect_storage_engine() -> str:
+    """Return a label for the active SQLAlchemy backend.
+
+    Previously this was hardcoded to 'sqlite', which misled the /data page
+    on PostgreSQL deployments. Derive the label from settings.database_url
+    so the badge reflects reality.
+    """
+    url = (settings.database_url or "").lower()
+    if url.startswith("sqlite"):
+        return "sqlite"
+    if url.startswith("postgresql"):
+        return "postgresql"
+    if url.startswith("mysql"):
+        return "mysql"
+    return "unknown"
 
 
 def _to_iso_naive(value) -> str | None:
@@ -259,7 +277,7 @@ async def data_quality_summary(symbol: str = "XAU/USD") -> dict:
         "database_health": {
             "total_candle_rows": total_candles_db,
             "historical_candle_rows": total_historical,
-            "storage_engine": "sqlite",
+            "storage_engine": _detect_storage_engine(),
             "ok": total_candles_db >= 0,
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
