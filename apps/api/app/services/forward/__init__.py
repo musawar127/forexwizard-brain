@@ -943,9 +943,9 @@ def get_forward_health() -> dict:
     pending_count = 0
     try:
         with SessionLocal() as session:
-            from sqlalchemy import func as sa_func
+            from sqlalchemy import func as sa_func, select as sa_select
             pending_count = session.scalar(
-                sa_func.count(ForwardObservation.id).where(
+                sa_select(sa_func.count(ForwardObservation.id)).where(
                     ForwardObservation.observation_status.in_(["PENDING", "PARTIALLY_EVALUATED"])
                 )
             ) or 0

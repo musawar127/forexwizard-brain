@@ -496,9 +496,9 @@ def _run_build_job_sync(job_id: str, instrument: str, base_timeframe: str, cfg: 
         sps = round(states_built / elapsed, 2) if elapsed > 0 and states_built > 0 else None
         # Phase 4.3: DB-as-source-of-truth reconciliation
         with SessionLocal() as recon_session:
-            from sqlalchemy import func as sa_func
+            from sqlalchemy import func as sa_func, select as sa_select
             db_count = recon_session.scalar(
-                sa_func.count(HistoricalMarketState.id).where(
+                sa_select(sa_func.count(HistoricalMarketState.id)).where(
                     HistoricalMarketState.instrument == instrument,
                     HistoricalMarketState.base_timeframe == base_timeframe,
                     HistoricalMarketState.feature_version == cfg.feature_version,
