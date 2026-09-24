@@ -1,0 +1,57 @@
+# VCS & metadata
+.git
+.gitignore
+.github
+.gitattributes
+
+# Local environment / secrets — NEVER ship to the image
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Local SQLite databases (dev artifacts)
+*.db
+*.db-shm
+*.db-wal
+apps/api/forexwizard.db
+apps/api/forexwizard_test.db
+
+# Python caches & venvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+apps/web/node_modules/
+apps/web/.next/
+apps/web/next-env.d.ts
+apps/web/tsconfig.tsbuildinfo
+
+# Build artifacts & logs
+logs/
+*.log
+*.pid
+upload/
+download/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docs (not needed at runtime)
+docs/
+*.md
+skills/
+
+# Misc
+docker-compose.yml

@@ -10,8 +10,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 apps/api/forexwizard.db
+forexwizard.db
 *.db-shm
 *.db-wal
+*.db
 
 # Node
 node_modules/
