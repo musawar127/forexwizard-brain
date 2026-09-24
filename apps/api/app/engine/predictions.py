@@ -10,6 +10,19 @@ from app.db.session import SessionLocal
 from app.models.market import BrainAnalysis
 
 
+def _to_aware_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC.
+
+    SQLite returns naive datetimes even for DateTime(timezone=True) columns,
+    while PostgreSQL returns aware datetimes for timestamptz columns. Mixing
+    them raises TypeError('offset-naive and offset-aware datetimes'). This
+    helper is the single chokepoint for cross-database datetime comparison.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 async def persist_prediction(analysis: BrainAnalysis) -> int | None:
     if analysis.price is None:
         return None
@@ -47,7 +60,7 @@ async def persist_prediction(analysis: BrainAnalysis) -> int | None:
 
 async def evaluate_outcomes() -> int:
     horizons = (15, 60, 240)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)  # aware UTC — works for both SQLite and Postgres
     evaluated = 0
     with SessionLocal() as session:
         predictions = session.scalars(
@@ -58,8 +71,12 @@ async def evaluate_outcomes() -> int:
         ).all()
 
         for pred in predictions:
+            # Normalize pred.timestamp to aware UTC — SQLite returns naive,
+            # Postgres returns aware. Without this, `target > now` raises
+            # TypeError when comparing naive and aware datetimes.
+            pred_ts = _to_aware_utc(pred.timestamp)
             for horizon in horizons:
-                target = pred.timestamp + timedelta(minutes=horizon)
+                target = pred_ts + timedelta(minutes=horizon)
                 if target > now:
                     continue
                 exists = session.scalar(
