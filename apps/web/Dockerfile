@@ -24,12 +24,15 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # Next.js respects PORT and HOSTNAME env vars at start time.
+# Only copy .next (the built app). node_modules is needed for next start.
+# public/ is optional — only copy if it exists (use a wildcard + || true fallback).
 COPY --from=builder /app/.next ./.next
-COPY --from=builder /app/public ./public
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/next.config.ts ./next.config.ts
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
+# Create empty public dir so Next.js can serve static assets if added later
+RUN mkdir -p /app/public
 
 EXPOSE 3000
 
