@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     environment: str = "development"
     frontend_origin: str = "http://localhost:3000"
 
+    # Phase 5.4: production CORS — comma-separated list of allowed origins.
+    # If set, takes priority over frontend_origin for CORS middleware.
+    # Example: "https://forexwizard.example.com,https://www.forexwizard.example.com"
+    cors_origins: str = ""
+
     # No-auth market source. Gold API asks clients to cache spot prices rather
     # than hammering the endpoint multiple times per second.
     gold_api_base_url: str = "https://api.gold-api.com"
@@ -50,6 +55,8 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Phase 5.4: allow PORT env var for cloud deployment
+        env_prefix="",
     )
 
 

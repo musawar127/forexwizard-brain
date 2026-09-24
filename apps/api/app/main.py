@@ -174,13 +174,23 @@ async def _forward_validation_loop(stop_event: asyncio.Event) -> None:
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.3.0",
-    description="No-broker-login XAU/USD market intelligence starter with persistent local memory and Phase 3 historical market-memory layer.",
+    version="0.4.0",
+    description="No-broker-login XAU/USD market intelligence terminal with persistent local memory, historical market-memory layer, and forward validation.",
     lifespan=lifespan,
 )
+
+# Phase 5.4: production CORS — uses CORS_ORIGINS env if set, otherwise
+# falls back to frontend_origin for local development. Never uses
+# unrestricted CORS in production unless explicitly configured.
+_allowed_origins: list[str]
+if settings.cors_origins:
+    _allowed_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+else:
+    _allowed_origins = [settings.frontend_origin]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -33,9 +33,8 @@ npm start
 Use **NSSM** (Non-Sucking Service Manager):
 
 ```powershell
-# Install NSSM from https://nssm.cc/
 nssm install forexwizard-backend "C:\path\to\.venv\Scripts\uvicorn.exe" "app.main:app --host 0.0.0.0 --port 8000"
-nssm install forexwizard-frontend "C:\path\to\node\npx.exe" "next start --port 3000"
+nssm install forexwizard-frontend "C:\path\to\npx.exe" "next start --port 3000"
 nssm start forexwizard-backend
 nssm start forexwizard-frontend
 ```
@@ -72,23 +71,67 @@ sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE forexwizard TO fxuser
 DATABASE_URL=postgresql+psycopg://fxuser:your_secure_password@localhost:5432/forexwizard
 ```
 
-### Backend
+### Database migrations (Alembic)
 
 ```bash
+# From the project root:
+cd apps/api
+pip install -r requirements.txt  # includes alembic
+
+# Set DATABASE_URL to your PostgreSQL URL:
+export DATABASE_URL=postgresql+psycopg://fxuser:password@localhost:5432/forexwizard
+
+# Run migrations:
+alembic -c ../../alembic.ini upgrade head
+
+# Check current revision:
+alembic -c ../../alembic.ini current
+
+# Generate new migration after schema changes:
+alembic -c ../../alembic.ini revision --autogenerate -m "description of change"
+```
+
+### Backend deployment
+
+```bash
+# Clone from GitHub:
+git clone https://github.com/musawar127/forexwizard-brain.git /opt/forexwizard
 cd /opt/forexwizard/apps/api
+
+# Create venv + install:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Configure:
 cp .env.example .env
-# Edit .env with your DATABASE_URL
+# Edit .env:
+#   DATABASE_URL=postgresql+psycopg://fxuser:password@localhost:5432/forexwizard
+#   CORS_ORIGINS=https://your-frontend-domain.com
+#   FRONTEND_ORIGIN=https://your-frontend-domain.com
+
+# Run migrations:
+DATABASE_URL=postgresql+psycopg://fxuser:password@localhost:5432/forexwizard \
+  /home/z/.venv/bin/python3 -m alembic -c ../../alembic.ini upgrade head
+
+# Start (production):
+# Use $PORT for cloud environments (Railway, Render, Fly.io, etc.):
+uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
 ```
 
-### Frontend
+### Frontend deployment
 
 ```bash
 cd /opt/forexwizard/apps/web
 npm install
+
+# Configure backend URL:
+cat > .env.local << 'EOF'
+NEXT_PUBLIC_API_URL=https://your-backend-domain.com
+EOF
+
 npm run build
+npm start
 ```
 
 ### Process supervision with systemd
@@ -105,7 +148,10 @@ Type=simple
 User=fxuser
 WorkingDirectory=/opt/forexwizard/apps/api
 Environment=PYTHONPATH=/opt/forexwizard/apps/api
-ExecStart=/opt/forexwizard/apps/api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Environment=DATABASE_URL=postgresql+psycopg://fxuser:password@localhost:5432/forexwizard
+Environment=CORS_ORIGINS=https://your-frontend-domain.com
+EnvironmentFile=/opt/forexwizard/apps/api/.env
+ExecStart=/opt/forexwizard/apps/api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
 Restart=always
 RestartSec=5
 
@@ -124,10 +170,11 @@ After=network.target forexwizard-backend.service
 Type=simple
 User=fxuser
 WorkingDirectory=/opt/forexwizard/apps/web
+Environment=NEXT_PUBLIC_API_URL=https://your-backend-domain.com
+Environment=NODE_ENV=production
 ExecStart=/usr/bin/npx next start --port 3000
 Restart=always
 RestartSec=5
-Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target
@@ -144,35 +191,38 @@ Both services auto-restart on crash or machine reboot.
 
 ---
 
+## Environment variables reference
+
+### Backend (.env)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | Yes | `sqlite:///./forexwizard.db` | SQLAlchemy URL. Use `postgresql+psycopg://` for production. |
+| `CORS_ORIGINS` | Prod | (empty) | Comma-separated allowed frontend origins. Takes priority over FRONTEND_ORIGIN. |
+| `FRONTEND_ORIGIN` | No | `http://localhost:3000` | Fallback CORS origin for local dev. |
+| `PORT` | Cloud | `8000` | Port for uvicorn (cloud providers set this automatically). |
+| `TWELVE_DATA_API_KEY` | No | (empty) | Optional historical bootstrap provider. |
+| `GOLD_API_BASE_URL` | No | `https://api.gold-api.com` | Live spot price source. |
+
+### Frontend (.env.local)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NEXT_PUBLIC_API_URL` | Yes | `http://localhost:8000` | Backend API URL. Use your hosted domain in production. |
+
+---
+
 ## Backup procedures
 
 ### SQLite backup
 ```bash
-# Consistent backup (uses .backup command for WAL-aware snapshot):
 sqlite3 /opt/forexwizard/apps/api/forexwizard.db ".backup /backup/forexwizard-$(date +%Y%m%d).db"
-
-# Or copy the WAL + main DB:
-cp /opt/forexwizard/apps/api/forexwizard.db /backup/
-cp /opt/forexwizard/apps/api/forexwizard.db-wal /backup/ 2>/dev/null || true
-
-# Retention: keep 7 days
 find /backup/ -name "forexwizard-*.db" -mtime +7 -delete
 ```
 
 ### PostgreSQL backup
 ```bash
 pg_dump -U fxuser -d forexwizard -F c -f /backup/forexwizard-$(date +%Y%m%d).dump
-
-# Restore:
-pg_restore -U fxuser -d forexwizard -c /backup/forexwizard-20260923.dump
-```
-
-### Restore
-```bash
-# SQLite:
-cp /backup/forexwizard-20260923.db /opt/forexwizard/apps/api/forexwizard.db
-
-# PostgreSQL:
 pg_restore -U fxuser -d forexwizard -c /backup/forexwizard-20260923.dump
 ```
 
@@ -182,15 +232,12 @@ pg_restore -U fxuser -d forexwizard -c /backup/forexwizard-20260923.dump
 
 - `.env` files are in `.gitignore` — NEVER committed.
 - `.env.example` contains placeholders only — no real credentials.
-- API keys, database passwords, GitHub tokens stay in `.env` only.
 - `NEXT_PUBLIC_*` variables are visible to website visitors — NEVER put secrets there.
+- API keys, database passwords, GitHub tokens stay in `.env` or OS environment only.
 
 ---
 
 ## Log rotation
-
-### Backend logs (uvicorn)
-Logs go to `/var/log/forexwizard/`. Configure logrotate:
 
 ```bash
 # /etc/logrotate.d/forexwizard
@@ -205,21 +252,15 @@ Logs go to `/var/log/forexwizard/`. Configure logrotate:
 }
 ```
 
-### Frontend logs
-Next.js logs to stdout — systemd journal captures them. Use `journalctl`:
-
-```bash
-journalctl -u forexwizard-frontend -f --since "1 hour ago"
-```
-
 ---
 
-## Health monitoring
+## Health endpoints
 
 - `GET /health` — basic backend health
-- `GET /api/forward/health` — forward collector + evaluator status
+- `GET /api/system/status` — system mode (STARTING/CATCHING_UP/LIVE/DEGRADED)
 - `GET /api/system/health` — all subsystems summary
-- `GET /api/learning/status` — historical learning engine status
+- `GET /api/forward/health` — forward collector status
+- `GET /api/catchup/status` — catch-up coordinator status
 
 ---
 
@@ -229,10 +270,13 @@ journalctl -u forexwizard-frontend -f --since "1 hour ago"
 2. ☐ Install Python deps (`pip install -r requirements.txt`)
 3. ☐ Install npm deps (`npm install`)
 4. ☐ Copy `.env.example` → `.env`, set `DATABASE_URL`
-5. ☐ Start backend: `uvicorn app.main:app --port 8000`
-6. ☐ Start frontend: `npm run build && npm start`
-7. ☐ Verify: `curl http://localhost:8000/health`
-8. ☐ Open: `http://localhost:3000`
-9. ☐ Sync historical data: `POST /api/data/sync`
-10. ☐ Build learning states: `POST /api/learning/build-states`
-11. ☐ Forward validation starts automatically on first capture
+5. ☐ Copy `.env.local.example` → `.env.local`, set `NEXT_PUBLIC_API_URL`
+6. ☐ Run migrations: `alembic -c ../../alembic.ini upgrade head`
+7. ☐ Start backend: `uvicorn app.main:app --port ${PORT:-8000}`
+8. ☐ Start frontend: `npm run build && npm start`
+9. ☐ Verify: `curl http://localhost:8000/health`
+10. ☐ Open: `http://localhost:3000`
+11. ☐ Sync historical data: `POST /api/data/sync`
+12. ☐ Build learning states: `POST /api/learning/build-states`
+13. ☐ Forward validation starts automatically on first capture
+14. ☐ Catch-up recovery runs automatically on restart

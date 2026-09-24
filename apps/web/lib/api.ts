@@ -1,6 +1,8 @@
 import type { Candle, Snapshot } from "./types";
 
-export const API = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+// Phase 5.4: Use NEXT_PUBLIC_API_URL for production deployment.
+// Falls back to http://localhost:8000 for local development.
+export const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function getSnapshot(): Promise<Snapshot> {
   const response = await fetch(`${API}/api/market/xauusd`, { cache: "no-store" });
