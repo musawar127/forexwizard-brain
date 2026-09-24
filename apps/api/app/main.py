@@ -823,10 +823,14 @@ async def api_trade_plan_history(limit: int = Query(20, ge=1, le=200)):
     return trade_plan_list(limit=limit)
 
 
-@app.get("/api/trade-plan/{plan_id}")
-async def api_trade_plan_detail(plan_id: str):
-    """Return one plan + its lifecycle events + its forward-validation outcome."""
-    return trade_plan_get_plan(plan_id=plan_id)
+@app.get("/api/trade-plan/performance")
+async def api_trade_plan_performance():
+    """Aggregate performance metrics across all generated plans.
+
+    Reports total_plans, breakdowns by decision/status/lifecycle, and
+    forward-validation outcome summaries (entries touched, TPs reached,
+    SL hits, expired)."""
+    return trade_plan_get_performance()
 
 
 class PositionSizeRequest(BaseModel):
@@ -870,16 +874,6 @@ async def api_trade_plan_position_size(payload: PositionSizeRequest):
     }
 
 
-@app.get("/api/trade-plan/performance")
-async def api_trade_plan_performance():
-    """Aggregate performance metrics across all generated plans.
-
-    Reports total_plans, breakdowns by decision/status/lifecycle, and
-    forward-validation outcome summaries (entries touched, TPs reached,
-    SL hits, expired)."""
-    return trade_plan_get_performance()
-
-
 @app.post("/api/trade-plan/generate")
 async def api_trade_plan_generate():
     """Generate a fresh trade plan from the current Brain analysis.
@@ -892,6 +886,20 @@ async def api_trade_plan_generate():
     if state.analysis is None:
         return {"plan": None, "reason": "brain analysis not yet available"}
     return generate_trade_plan(state.analysis)
+
+
+# IMPORTANT: the {plan_id} wildcard route MUST come AFTER all the
+# fixed-path routes (current, history, performance, calculate-position-size,
+# generate), otherwise it would shadow them. FastAPI matches routes in
+# registration order, so the first matching route wins.
+@app.get("/api/trade-plan/{plan_id}")
+async def api_trade_plan_detail(plan_id: str):
+    """Return one plan + its lifecycle events + its forward-validation outcome."""
+    # Defensive: if someone hits /api/trade-plan/performance via this route
+    # by mistake, redirect them to the dedicated endpoint.
+    if plan_id in ("performance", "current", "history"):
+        return {"plan": None, "reason": f"use GET /api/trade-plan/{plan_id} (fixed route)"}
+    return trade_plan_get_plan(plan_id=plan_id)
 
 
 @app.websocket("/ws/market")
