@@ -350,8 +350,8 @@ def _count_invalid_candles(symbol: str, interval: str) -> int:
                   AND (open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
                        OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
                        OR high < low
-                       OR high < max(open, close)
-                       OR low > min(open, close))
+                       OR high < open OR high < close
+                       OR low > open OR low > close)
                 """
             ),
             {"sym": symbol, "iv": interval},
