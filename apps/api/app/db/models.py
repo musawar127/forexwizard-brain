@@ -337,7 +337,12 @@ class HistoricalOutcome(Base):
     # Phase 4.1: window validity + roll-boundary + exclusion metadata
     horizon_valid: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     actual_elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
-    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Phase 5.5: widened from String(64) -> String(255). The roll_detector
+    # produces a diagnostic string like "actual elapsed 17394.4h exceeds
+    # expected 0.2h by >2.0x — likely weekend/holiday/maintenance closure"
+    # which is ~95 chars. SQLite silently accepted this; PostgreSQL rejects
+    # it with StringDataRightTruncation. 255 chars gives comfortable headroom.
+    invalid_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     possible_contract_roll: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     roll_gap_size: Mapped[float | None] = mapped_column(Float, nullable=True)
     excluded_from_learning: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
@@ -530,7 +535,9 @@ class ForwardObservation(Base):
     observation_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
     # PENDING → PARTIALLY_EVALUATED → COMPLETE / INVALID
     # Phase 5.1: invalid_reason for observations that violate rules
-    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Phase 5.5: widened from String(64) -> String(255) for parity with
+    # historical_outcomes.invalid_reason (see Phase 5.5 migration).
+    invalid_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Phase 5.1: WAIT alignment semantics — for WAIT observations,
     # historical_alignment = NOT_APPLICABLE and wait_historical_context is used instead.
@@ -589,7 +596,9 @@ class ForwardOutcome(Base):
 
     # Phase 5.1: outcome status + invalid reason + target timestamp metadata
     outcome_status: Mapped[str] = mapped_column(String(16), default="PENDING")  # PENDING/VALID/INVALID
-    invalid_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Phase 5.5: widened from String(64) -> String(255) for parity with
+    # historical_outcomes.invalid_reason.
+    invalid_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # INSUFFICIENT_SPOT_DATA / TARGET_TIMESTAMP_MISSING / MARKET_CLOSURE / BAD_SOURCE_DATA / OBSERVATION_INVALID
 
     target_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
