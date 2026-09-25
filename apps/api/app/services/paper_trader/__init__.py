@@ -854,7 +854,7 @@ def get_paper_trader_status() -> dict:
         completed_count = session.scalar(
             select(sa_func.count(PaperTrade.id))
             .where(PaperTrade.status.in_(list(TERMINAL_STATES) + ["BREAKEVEN"]))
-        )) or 0
+        ) or 0
         # Latest review
         latest_review = session.scalar(
             select(TradeReview).order_by(TradeReview.created_at.desc()).limit(1)
