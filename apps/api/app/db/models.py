@@ -918,7 +918,7 @@ class StrategyKnowledge(Base):
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     category: Mapped[str] = mapped_column(String(32), index=True)  # MARKET_STRUCTURE / LIQUIDITY / ICT_SMC / SESSIONS
     definition: Mapped[str] = mapped_column(Text)
-    detection_rule_version: Mapped[str] = mapped_column(String(16), default="v0.1")
+    detection_rule_version: Mapped[str] = mapped_column(String(32), default="v0.1")
     source: Mapped[str] = mapped_column(String(64), default="ICT/SMC standard")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
