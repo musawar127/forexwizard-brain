@@ -1103,3 +1103,219 @@ class IctCandidatePattern(Base):
     # Status
     status: Mapped[str] = mapped_column(String(32), default="EXPERIMENTAL", index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ============================================================
+# Phase 6A: Self-learning paper trader + loss review engine
+# ============================================================
+# PAPER / SHADOW TRADING ONLY. No real broker orders. No MT5.
+# The paper trader virtually executes actionable ICT trade plans,
+# tracks entry/SL/TP lifecycle with event ordering, runs post-trade
+# review, classifies losses, stores repeating mistake patterns, and
+# creates candidate strategy improvements — but NEVER auto-promotes
+# a candidate into the production decision engine.
+# ============================================================
+
+
+class PaperAccount(Base):
+    """Phase 6A: paper trading account (simulation only)."""
+
+    __tablename__ = "paper_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    paper_account_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    starting_equity: Mapped[float] = mapped_column(Float, default=10000.0)
+    current_equity: Mapped[float] = mapped_column(Float, default=10000.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    max_equity: Mapped[float] = mapped_column(Float, default=10000.0)
+    max_drawdown: Mapped[float] = mapped_column(Float, default=0.0)
+    paper_trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    win_count: Mapped[int] = mapped_column(Integer, default=0)
+    loss_count: Mapped[int] = mapped_column(Integer, default=0)
+    breakeven_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PaperTrade(Base):
+    """Phase 6A: a virtually-executed paper trade.
+
+    Created from an actionable TradePlan (plan_status ACTIONABLE or
+    WAIT_FOR_ENTRY). Tracks entry/SL/TP lifecycle with event ordering,
+    MFE/MAE, R-multiple, and immutable market-state snapshot.
+    """
+
+    __tablename__ = "paper_trades"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    paper_trade_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    trade_plan_id: Mapped[str] = mapped_column(String(32), index=True)  # FK -> trade_plans.plan_id
+    paper_account_id: Mapped[str] = mapped_column(String(32), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), default="XAU/USD")
+    direction: Mapped[str] = mapped_column(String(8))  # BUY / SELL
+
+    # Entry zone from the plan
+    entry_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    preferred_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    actual_paper_entry: Mapped[float | None] = mapped_column(Float, nullable=True)  # filled when entry touched
+
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp2: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp3: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_objective: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Lifecycle: WAITING_FOR_ENTRY / ACTIVE / TP1_REACHED / TP2_REACHED /
+    # TP3_REACHED / MAX_REACHED / STOPPED / BREAKEVEN / EXPIRED / INVALIDATED / CANCELLED
+    status: Mapped[str] = mapped_column(String(24), default="WAITING_FOR_ENTRY", index=True)
+
+    entry_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Results (price points + R-multiple)
+    realized_pnl_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_r_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe: Mapped[float | None] = mapped_column(Float, nullable=True)  # max favorable excursion
+    mae: Mapped[float | None] = mapped_column(Float, nullable=True)  # max adverse excursion
+
+    # Timing
+    time_to_entry: Mapped[float | None] = mapped_column(Float, nullable=True)  # seconds
+    time_to_tp1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_tp2: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_tp3: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Breakeven management (management-v0.1)
+    breakeven_activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    breakeven_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Setup fingerprint + versioning
+    setup_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_version: Mapped[str] = mapped_column(String(16), default="ict-plan-v0.1")
+    plan_engine_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Immutable market-state snapshot (JSON) — frozen at trade creation
+    market_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TradeReview(Base):
+    """Phase 6A: post-trade review for completed paper trades."""
+
+    __tablename__ = "trade_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    review_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    paper_trade_id: Mapped[str] = mapped_column(String(32), index=True)
+    result: Mapped[str] = mapped_column(String(16))  # WIN / LOSS / BREAKEVEN
+    r_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    what_worked_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    what_failed_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mistake_tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    market_context_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    primary_failure_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    secondary_failure_reasons: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
+    review_version: Mapped[str] = mapped_column(String(16), default="review-v0.1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class StrategyMistakePattern(Base):
+    """Phase 6A: repeating mistake patterns observed across paper trades.
+
+    Status flow: OBSERVED -> REPEATING -> UNDER_REVIEW -> (ACTIONABLE_CANDIDATE | DISMISSED)
+    NEVER auto-promoted into production rules.
+    """
+
+    __tablename__ = "strategy_mistake_patterns"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    pattern_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    mistake_type: Mapped[str] = mapped_column(String(64), index=True)
+    conditions_json: Mapped[str] = mapped_column(Text)  # describes the conditions
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=0)
+    loss_count: Mapped[int] = mapped_column(Integer, default=0)
+    win_count: Mapped[int] = mapped_column(Integer, default=0)
+    avg_r: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="OBSERVED", index=True)
+    # OBSERVED / REPEATING / UNDER_REVIEW / DISMISSED / ACTIONABLE_CANDIDATE
+
+
+class CandidateStrategyRule(Base):
+    """Phase 6A: candidate strategy improvements from mistake patterns.
+
+    Status flow: EXPERIMENTAL -> COLLECTING_DATA -> UNDER_REVIEW ->
+                 (VALIDATED_CANDIDATE | REJECTED | ARCHIVED)
+
+    NEVER auto-promoted into production BUY/SELL engine.
+    Actual production integration happens in a later gated phase.
+    """
+
+    __tablename__ = "candidate_strategy_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    candidate_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    description: Mapped[str] = mapped_column(Text)
+    trigger_conditions_json: Mapped[str] = mapped_column(Text)
+    proposed_change_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_pattern: Mapped[str | None] = mapped_column(String(32), nullable=True)  # FK -> strategy_mistake_patterns
+    source_trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    historical_sample: Mapped[int] = mapped_column(Integer, default=0)
+    forward_sample: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    candidate_metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="EXPERIMENTAL", index=True)
+    # EXPERIMENTAL / COLLECTING_DATA / UNDER_REVIEW / VALIDATED_CANDIDATE / REJECTED / ARCHIVED
+
+
+class ExternalStrategyKnowledge(Base):
+    """Phase 6A: external strategy ingestion framework (Matrix etc.).
+
+    Status flow: RAW -> PARSED -> STRUCTURED -> TESTING ->
+                 (VALIDATED_CANDIDATE | REJECTED)
+
+    Do NOT add Matrix rules until actual source material is provided.
+    """
+
+    __tablename__ = "external_strategy_knowledge"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    strategy_name: Mapped[str] = mapped_column(String(64))
+    source_type: Mapped[str] = mapped_column(String(32))  # VIDEO / PDF / COURSE_NOTES / WRITTEN / TRADE_EXAMPLE
+    source_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    concepts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exit_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    invalidation_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timeframe_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="RAW", index=True)
+    # RAW / PARSED / STRUCTURED / TESTING / VALIDATED_CANDIDATE / REJECTED
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperTraderAuditLog(Base):
+    """Phase 6A: audit log for paper trader events."""
+
+    __tablename__ = "paper_trader_audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(48), index=True)
+    # PAPER_TRADE_CREATED / PAPER_ENTRY_TOUCHED / PAPER_TP1 / PAPER_TP2 /
+    # PAPER_TP3 / PAPER_MAX / PAPER_STOP / PAPER_BREAKEVEN /
+    # POST_TRADE_REVIEW_COMPLETE / MISTAKE_PATTERN_UPDATED /
+    # CANDIDATE_RULE_CREATED / CANDIDATE_RULE_REJECTED
+    paper_trade_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    detail: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    market_price: Mapped[float | None] = mapped_column(Float, nullable=True)

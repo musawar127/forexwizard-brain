@@ -62,6 +62,19 @@ from app.services.ict import (
     seed_knowledge as ict_seed_knowledge,
     list_knowledge as ict_list_knowledge,
 )
+# Phase 6A: self-learning paper trader
+from app.services.paper_trader import (
+    PAPER_TRADE_VERSION,
+    create_paper_trade_from_plan,
+    evaluate_paper_trades as paper_evaluate,
+    paper_trader_loop,
+    get_paper_trader_status,
+    list_paper_trades,
+    get_paper_trade,
+    get_paper_trader_performance,
+    list_mistake_patterns,
+    list_candidate_rules,
+)
 from app.services.catchup import (
     get_catchup_status,
     get_catchup_job,
@@ -124,6 +137,10 @@ async def lifespan(app: FastAPI):
     # live plans (entry touch? SL hit? TP1-4 reached? MFE/MAE? expiry?).
     trade_plan_task = asyncio.create_task(trade_plan_validation_loop(stop_event))
 
+    # Phase 6A: paper trader evaluation loop — every 60s evaluates live
+    # paper trades (entry touch? SL/TP lifecycle? MFE/MAE? terminal → review?).
+    paper_trader_task = asyncio.create_task(paper_trader_loop(stop_event))
+
     # Phase 5.2: startup recovery for forward validation
     try:
         recovery_result = await startup_recovery()
@@ -166,6 +183,10 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(trade_plan_task, timeout=5)
     except asyncio.TimeoutError:
         trade_plan_task.cancel()
+    try:
+        await asyncio.wait_for(paper_trader_task, timeout=5)
+    except asyncio.TimeoutError:
+        paper_trader_task.cancel()
     engine.dispose()
 
 
@@ -1024,6 +1045,94 @@ async def api_trade_plan_detail(plan_id: str):
     if plan_id in ("performance", "current", "history"):
         return {"plan": None, "reason": f"use GET /api/trade-plan/{plan_id} (fixed route)"}
     return trade_plan_get_plan(plan_id=plan_id)
+
+
+# ============================================================
+# Phase 6A: Paper trader API — PAPER / SHADOW TRADING ONLY
+# ============================================================
+
+@app.get("/api/paper-trader/status")
+async def api_paper_trader_status():
+    """Paper trader status: account equity, active trades, last evaluation."""
+    return get_paper_trader_status()
+
+
+@app.get("/api/paper-trader/trades")
+async def api_paper_trader_trades(limit: int = Query(20, ge=1, le=200)):
+    """List recent paper trades (newest first)."""
+    return list_paper_trades(limit=limit)
+
+
+@app.get("/api/paper-trader/trades/{paper_trade_id}")
+async def api_paper_trader_trade_detail(paper_trade_id: str):
+    """Get one paper trade + its post-trade review + market snapshot."""
+    return get_paper_trade(paper_trade_id=paper_trade_id)
+
+
+@app.get("/api/paper-trader/performance")
+async def api_paper_trader_performance():
+    """Paper trader performance: win/loss/BE, avg R, MFE/MAE, drawdown."""
+    return get_paper_trader_performance()
+
+
+@app.get("/api/paper-trader/mistakes")
+async def api_paper_trader_mistakes():
+    """List repeating mistake patterns."""
+    return list_mistake_patterns()
+
+
+@app.get("/api/paper-trader/candidates")
+async def api_paper_trader_candidates():
+    """List candidate strategy rules (EXPERIMENTAL — NOT auto-promoted)."""
+    return list_candidate_rules()
+
+
+@app.post("/api/paper-trader/evaluate")
+async def api_paper_trader_evaluate():
+    """Manually trigger paper trade evaluation (entry/SL/TP lifecycle check).
+
+    The background loop also runs this every 60s automatically.
+    """
+    summary = await paper_evaluate()
+    return summary
+
+
+@app.post("/api/paper-trader/create-from-current-plan")
+async def api_paper_trader_create_from_plan():
+    """Create a paper trade from the current actionable trade plan.
+
+    Only ACTIONABLE or WAIT_FOR_ENTRY plans are eligible.
+    WAIT / NO_TRADE → returns PAPER_TRADER_WAITING_FOR_ACTIONABLE_SETUP.
+    One trade_plan_id → maximum ONE paper trade (no duplicates).
+    """
+    if state.analysis is None:
+        return {"status": "PAPER_TRADER_WAITING_FOR_ACTIONABLE_SETUP",
+                "reason": "brain analysis not yet available"}
+    # Generate a fresh ICT plan first
+    plan_dict = generate_ict_trade_plan(state.analysis)
+    if plan_dict.get("plan_status") not in ("ACTIONABLE", "WAIT_FOR_ENTRY"):
+        return {"status": "PAPER_TRADER_WAITING_FOR_ACTIONABLE_SETUP",
+                "reason": f"current plan status is {plan_dict.get('plan_status')}",
+                "brain_decision": plan_dict.get("brain_decision"),
+                "plan_status": plan_dict.get("plan_status")}
+    # Look up the persisted plan
+    from app.db.session import SessionLocal
+    from app.db.models import TradePlan
+    from sqlalchemy import select as sa_select
+    plan_id = plan_dict.get("plan_id")
+    if not plan_id:
+        return {"status": "ERROR", "reason": "no plan_id in generated plan"}
+    with SessionLocal() as session:
+        plan = session.scalar(
+            sa_select(TradePlan).where(TradePlan.plan_id == plan_id).limit(1)
+        )
+        if plan is None:
+            return {"status": "ERROR", "reason": f"plan {plan_id} not found in DB"}
+        result = create_paper_trade_from_plan(plan)
+        if result is None:
+            return {"status": "PAPER_TRADER_WAITING_FOR_ACTIONABLE_SETUP",
+                    "reason": "plan not actionable"}
+        return {"status": "PAPER_TRADE_CREATED", **result}
 
 
 @app.websocket("/ws/market")
