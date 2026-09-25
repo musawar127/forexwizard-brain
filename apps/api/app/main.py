@@ -84,6 +84,21 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         state.last_error = f"Database migration failed: {exc}"
 
+    # Phase 5.7: seed the ICT/SMC strategy knowledge dictionary (idempotent).
+    try:
+        from app.db.session import SessionLocal
+        from app.services.ict import seed_knowledge as ict_seed_knowledge
+        with SessionLocal() as session:
+            inserted = ict_seed_knowledge(session)
+            if inserted > 0:
+                import logging
+                logging.getLogger("forexwizard").info(
+                    "ICT knowledge seeded: %d new concepts", inserted
+                )
+    except Exception as exc:
+        import logging
+        logging.getLogger("forexwizard").warning("ICT knowledge seed failed: %s", exc)
+
     # Phase 4.2: detect orphaned RUNNING build jobs from a previous process.
     # Mark them as INTERRUPTED so they can be resumed via the resume endpoint.
     try:
@@ -898,23 +913,6 @@ async def api_trade_plan_generate():
 # ============================================================
 # Phase 5.7: ICT/SMC strategy reasoning endpoints
 # ============================================================
-
-@app.on_event("startup")
-async def _seed_ict_knowledge():
-    """Seed the strategy knowledge dictionary on startup (idempotent)."""
-    try:
-        from app.db.session import SessionLocal
-        with SessionLocal() as session:
-            inserted = ict_seed_knowledge(session)
-            if inserted > 0:
-                import logging
-                logging.getLogger("forexwizard").info(
-                    "ICT knowledge seeded: %d new concepts", inserted
-                )
-    except Exception as exc:
-        import logging
-        logging.getLogger("forexwizard").warning("ICT knowledge seed failed: %s", exc)
-
 
 @app.get("/api/ict/knowledge")
 async def api_ict_knowledge():
