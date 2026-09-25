@@ -79,13 +79,46 @@ async def _fetch_candles_async(tf: str, limit: int = 200) -> list[Candle]:
 
 
 def _fetch_candles_sync(tf: str, limit: int = 200) -> list[Candle]:
-    """Sync wrapper — used when called from non-async contexts (rare)."""
+    """Synchronous candle fetch — queries the DB directly without an event loop.
+
+    The async get_candles() function actually does a sync DB query inside,
+    but wrapping it in asyncio.new_event_loop() can fail in some contexts.
+    This helper queries CandleRecord directly and returns Candle objects.
+    """
     try:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(get_candles(tf, limit))
-        finally:
-            loop.close()
+        from app.db.session import SessionLocal
+        from app.db.models import CandleRecord
+        from app.engine.candles import ensure_utc
+        with SessionLocal() as session:
+            rows = session.scalars(
+                select(CandleRecord)
+                .where(CandleRecord.symbol == "XAU/USD", CandleRecord.interval == tf)
+                .order_by(CandleRecord.timestamp.desc())
+                .limit(limit)
+            ).all()
+        rows = list(rows)
+        rows.reverse()
+        return [
+            Candle(
+                symbol=r.symbol,
+                interval=r.interval,
+                timestamp=ensure_utc(r.timestamp),
+                open=r.open,
+                high=r.high,
+                low=r.low,
+                close=r.close,
+                volume=r.volume,
+                sample_count=r.sample_count,
+                provider=r.provider,
+                is_historical=bool(getattr(r, "is_historical", False)),
+                derivation=getattr(r, "derivation", None) or "SAMPLED",
+                provider_symbol=getattr(r, "provider_symbol", None) or "XAU",
+                instrument=getattr(r, "instrument", None) or "XAUUSD_SPOT",
+                source_timeframe=getattr(r, "source_timeframe", None) or "TICK",
+                target_timeframe=getattr(r, "target_timeframe", None) or r.interval,
+            )
+            for r in rows
+        ]
     except Exception:
         return []
 
