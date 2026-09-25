@@ -829,6 +829,17 @@ class TradePlan(Base):
     # plan_engine_version distinguishes Phase 5.6 ('trade-plan-v0.1')
     # from Phase 5.7 ICT-driven plans ('ict-plan-v0.1').
 
+    # Phase 5.7.1: dedup + quality hardening
+    setup_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # SHA-256 hash of (decision + M15_completed_candle_ts + HTF_trend +
+    # M15_trend + latest_MSS/CHoCH + liquidity_sweep + FVG + OB +
+    # premium/discount_location). Used for dedup: if a plan with the same
+    # fingerprint already exists, generate returns it with
+    # reused_existing_plan=true instead of inserting a new row.
+    short_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Concise reason label for the previous-plans table, e.g.
+    # "WAIT — no M15 MSS", "SELL — buy-side sweep + bearish MSS".
+
 
 class TradePlanLifecycleEvent(Base):
     """Phase 5.6: immutable record of every lifecycle transition for a plan.

@@ -433,7 +433,12 @@ def get_plan(plan_id: str) -> dict:
 
 
 def get_performance() -> dict:
-    """Aggregate performance metrics across all plans."""
+    """Aggregate performance metrics across all plans.
+
+    Phase 5.7.1: WAIT decisions are reported SEPARATELY from actionable
+    BUY/SELL plans. Repeated WAIT snapshots are NOT treated as trading
+    performance — they're informational market-state records.
+    """
     with SessionLocal() as session:
         # Total counts
         all_plans = list(session.execute(select(TradePlan)).scalars())
@@ -441,12 +446,49 @@ def get_performance() -> dict:
         by_decision = {}
         by_status = {}
         by_lifecycle = {}
+        by_engine_version = {}
+        # Phase 5.7.1: separate WAIT from actionable
+        wait_count = 0
+        actionable_buy_count = 0
+        actionable_sell_count = 0
+        no_trade_count = 0
         for p in all_plans:
             by_decision[p.brain_decision] = by_decision.get(p.brain_decision, 0) + 1
             by_status[p.plan_status] = by_status.get(p.plan_status, 0) + 1
             by_lifecycle[p.lifecycle_state] = by_lifecycle.get(p.lifecycle_state, 0) + 1
-        # Outcome counts
-        outcomes = list(session.execute(select(TradePlanOutcome)).scalars())
+            ev = p.plan_engine_version or "trade-plan-v0.1"
+            by_engine_version[ev] = by_engine_version.get(ev, 0) + 1
+
+            if p.brain_decision == "WAIT" or p.plan_status == "NO_TRADE":
+                wait_count += 1
+            elif p.brain_decision == "BUY" and p.plan_status in ("ACTIONABLE", "WAIT_FOR_ENTRY"):
+                actionable_buy_count += 1
+            elif p.brain_decision == "SELL" and p.plan_status in ("ACTIONABLE", "WAIT_FOR_ENTRY"):
+                actionable_sell_count += 1
+            if p.plan_status == "NO_TRADE":
+                no_trade_count += 1
+
+        # Determine version display: MIXED if multiple engine versions exist
+        if len(by_engine_version) > 1:
+            version_display = "MIXED"
+        elif by_engine_version:
+            version_display = list(by_engine_version.keys())[0]
+        else:
+            version_display = PLAN_VERSION
+
+        # Outcome counts — only for ACTIONABLE plans (not WAIT)
+        actionable_plan_ids = [
+            p.plan_id for p in all_plans
+            if p.plan_status in ("ACTIONABLE", "WAIT_FOR_ENTRY")
+        ]
+        if actionable_plan_ids:
+            outcomes = list(
+                session.execute(
+                    select(TradePlanOutcome).where(TradePlanOutcome.plan_id.in_(actionable_plan_ids))
+                ).scalars()
+            )
+        else:
+            outcomes = []
         outcome_summary = {
             "total_outcomes_tracked": len(outcomes),
             "entry_touched_count": sum(1 for o in outcomes if o.entry_touched),
@@ -461,6 +503,14 @@ def get_performance() -> dict:
             "by_decision": by_decision,
             "by_plan_status": by_status,
             "by_lifecycle_state": by_lifecycle,
+            "by_engine_version": by_engine_version,
+            "version_display": version_display,
+            # Phase 5.7.1: WAIT separated from actionable
+            "wait_count": wait_count,
+            "actionable_buy_count": actionable_buy_count,
+            "actionable_sell_count": actionable_sell_count,
+            "no_trade_count": no_trade_count,
+            "actionable_total": actionable_buy_count + actionable_sell_count,
             "outcome_summary": outcome_summary,
             "plan_version": PLAN_VERSION,
         }
@@ -531,6 +581,10 @@ def _plan_row_to_dict(plan: TradePlan) -> dict:
             "against_evidence": against_ev,
             "session_context": session_ctx,
             "setup_pattern_id": plan.setup_pattern_id,
+            # Phase 5.7.1: dedup + quality hardening
+            "setup_fingerprint": plan.setup_fingerprint,
+            "short_reason": plan.short_reason,
+            "reused_existing_plan": False,  # default; set to True when dedup returns existing
         }
     }
 

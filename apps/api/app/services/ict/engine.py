@@ -14,6 +14,7 @@ All detection is PROSPECTIVE — no historical backfill of plan outcomes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -384,6 +385,159 @@ def _persist_or_update_pattern_stat(session, signature: dict, plan_id: str) -> s
     return pattern_id
 
 
+# ---------- Phase 5.7.1: dedup fingerprint + short reason ----------
+
+def _last_completed_m15_timestamp(candles_m15: list[Candle]) -> datetime | None:
+    """Return the timestamp of the most recent CLOSED M15 candle.
+
+    A candle is 'closed' if its timestamp is in the past relative to now.
+    For M15, the candle starting at 14:15 is 'completed' at 14:30.
+    We use the candle's own timestamp (the OPEN time) as the identity —
+    two generate calls within the same M15 window see the same candle list
+    and therefore the same last-completed timestamp.
+    """
+    if not candles_m15:
+        return None
+    now = datetime.now(timezone.utc)
+    # Filter to candles whose close time (timestamp + 15min) is <= now
+    completed = [
+        c for c in candles_m15
+        if c.timestamp.replace(tzinfo=timezone.utc if c.timestamp.tzinfo is None else c.timestamp.tzinfo)
+        + __import__("datetime").timedelta(minutes=15) <= now
+    ]
+    if not completed:
+        # Fall back to the latest candle if none are 'completed' yet
+        # (e.g. first 15 minutes after restart)
+        latest = candles_m15[-1]
+        ts = latest.timestamp
+        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+    latest = completed[-1]
+    ts = latest.timestamp
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+def _compute_setup_fingerprint(
+    *,
+    decision: str,
+    m15_completed_ts: datetime | None,
+    htf_trend: str,
+    m15_trend: str,
+    latest_mss_event,  # StructureEvent | None
+    latest_sweep,     # LiquiditySweep | None
+    nearest_fvg,      # FVG | None
+    nearest_ob,       # OrderBlock | None
+    location: str,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint from market-state elements.
+
+    Two generate calls with the same fingerprint represent the same market
+    state — the second call should return the existing plan with
+    reused_existing_plan=true rather than inserting a duplicate row.
+    """
+    parts: list[str] = [
+        f"decision={decision}",
+        f"m15_ts={m15_completed_ts.isoformat() if m15_completed_ts else 'NONE'}",
+        f"htf={htf_trend}",
+        f"m15={m15_trend}",
+    ]
+    if latest_mss_event is not None:
+        parts.append(f"mss={latest_mss_event.event_type}:{latest_mss_event.direction}")
+    else:
+        parts.append("mss=NONE")
+    if latest_sweep is not None:
+        parts.append(f"sweep={latest_sweep.direction}:{latest_sweep.level_kind}:{round(latest_sweep.level, 2)}")
+    else:
+        parts.append("sweep=NONE")
+    if nearest_fvg is not None:
+        parts.append(f"fvg={nearest_fvg.direction}:{round(nearest_fvg.midpoint, 2)}")
+    else:
+        parts.append("fvg=NONE")
+    if nearest_ob is not None:
+        parts.append(f"ob={nearest_ob.direction}:{round(nearest_ob.midpoint, 2)}")
+    else:
+        parts.append("ob=NONE")
+    parts.append(f"loc={location}")
+
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _derive_short_reason(reasoning: SetupReasoning) -> str:
+    """Derive a concise reason label for the previous-plans table.
+
+    Examples:
+      WAIT — no M15 MSS
+      WAIT — HTF conflict
+      WAIT — no liquidity sweep
+      SELL — buy-side sweep + bearish MSS
+      BUY — sell-side sweep + bullish MSS
+    """
+    direction = reasoning.direction
+
+    if direction == "WAIT":
+        # Find the first AGAINST evidence that explains why
+        reasons: list[str] = []
+        if reasoning.htf_trend == "RANGE":
+            reasons.append("HTF RANGE")
+        if not reasoning.liquidity_swept:
+            reasons.append("no liquidity sweep")
+        # Check if there's no MSS
+        has_mss = False
+        for ev in reasoning.for_evidence:
+            if ev.kind in ("CHoCH", "MSS"):
+                has_mss = True
+                break
+        if not has_mss:
+            reasons.append("no M15 MSS")
+        # Check HTF conflict (HTF direction conflicts with the sweep direction)
+        if reasoning.liquidity_swept and reasoning.sweep_direction:
+            # SELL_SIDE sweep = bullish signal; if HTF is bearish, that's a conflict
+            if reasoning.sweep_direction == "SELL_SIDE" and reasoning.htf_trend == "BEARISH":
+                reasons.append("HTF conflict")
+            elif reasoning.sweep_direction == "BUY_SIDE" and reasoning.htf_trend == "BULLISH":
+                reasons.append("HTF conflict")
+        if not reasons:
+            reasons.append("insufficient setup")
+        return f"WAIT — {' + '.join(reasons)}"
+
+    # BUY or SELL
+    sweep_desc = ""
+    mss_desc = ""
+    if reasoning.sweep_direction:
+        if reasoning.sweep_direction == "SELL_SIDE":
+            sweep_desc = "sell-side sweep"
+        elif reasoning.sweep_direction == "BUY_SIDE":
+            sweep_desc = "buy-side sweep"
+    # Find MSS direction
+    for ev in reasoning.for_evidence:
+        if ev.kind in ("CHoCH", "MSS"):
+            mss_desc = f"{ev.bullish_or_bearish.lower()} {ev.kind}"
+            break
+
+    parts = [p for p in (sweep_desc, mss_desc) if p]
+    if not parts:
+        parts.append("structural setup")
+    return f"{direction} — {' + '.join(parts)}"
+
+
+def _find_existing_plan_by_fingerprint(fingerprint: str) -> TradePlan | None:
+    """Look up an existing plan with the same setup_fingerprint.
+
+    Only returns plans that are not terminal (i.e. still in CREATED /
+    WAITING_FOR_ENTRY / ACTIVE / etc.). Terminal plans (STOPPED / EXPIRED /
+    INVALIDATED) don't block new plan creation.
+    """
+    from app.services.trade_plan.lifecycle import LIVE_STATES
+    with SessionLocal() as session:
+        return session.scalar(
+            select(TradePlan)
+            .where(TradePlan.setup_fingerprint == fingerprint)
+            .where(TradePlan.lifecycle_state.in_(list(LIVE_STATES)))
+            .order_by(TradePlan.created_at.desc())
+            .limit(1)
+        )
+
+
 def generate_ict_trade_plan(analysis: BrainAnalysis) -> dict:
     """Main entry point — generate an ICT/SMC-driven trade plan.
 
@@ -490,6 +644,49 @@ def generate_ict_trade_plan(analysis: BrainAnalysis) -> dict:
         candles_h1=h1_candles,
     )
 
+    # Phase 5.7.1: compute setup fingerprint + short reason for dedup
+    m15_completed_ts = _last_completed_m15_timestamp(m15_candles)
+    # Find latest MSS/CHoCH event from M15
+    latest_mss_event = None
+    if mtf.m15 is not None and mtf.m15.events:
+        for ev in reversed(mtf.m15.events):
+            if ev.event_type in ("CHoCH", "MSS"):
+                latest_mss_event = ev
+                break
+    # Find nearest active FVG/OB in the reasoning direction
+    from .fvg import nearest_fvg_to_price, active_fvgs
+    from .order_blocks import nearest_ob_to_price, active_order_blocks
+    fvg_dir = "BULLISH" if reasoning.direction == "BUY" else "BEARISH" if reasoning.direction == "SELL" else None
+    ob_dir = fvg_dir
+    nearest_fvg = nearest_fvg_to_price(active_fvgs(fvgs_m15), analysis.price, direction=fvg_dir) if fvg_dir else None
+    nearest_ob = nearest_ob_to_price(active_order_blocks(obs_m15), analysis.price, direction=ob_dir) if ob_dir else None
+
+    fingerprint = _compute_setup_fingerprint(
+        decision=reasoning.direction,
+        m15_completed_ts=m15_completed_ts,
+        htf_trend=reasoning.htf_trend,
+        m15_trend=reasoning.m15_trend,
+        latest_mss_event=latest_mss_event,
+        latest_sweep=recent_sweep,
+        nearest_fvg=nearest_fvg,
+        nearest_ob=nearest_ob,
+        location=reasoning.location,
+    )
+    short_reason = _derive_short_reason(reasoning)
+
+    # Phase 5.7.1: dedup — if a live plan with the same fingerprint exists,
+    # return it with reused_existing_plan=true instead of inserting a dup.
+    existing_plan = _find_existing_plan_by_fingerprint(fingerprint)
+    if existing_plan is not None:
+        from app.services.trade_plan.engine import _plan_row_to_dict
+        result = _plan_row_to_dict(existing_plan)
+        result["plan"]["reused_existing_plan"] = True
+        result["plan"]["reused_reason"] = (
+            f"market state unchanged (fingerprint={fingerprint}, "
+            f"M15 candle={m15_completed_ts.isoformat() if m15_completed_ts else 'NONE'})"
+        )
+        return result["plan"]
+
     # ---------- WAIT / NO_TRADE branch ----------
     if reasoning.direction == "WAIT":
         plan = _wait_plan(plan_id, analysis, reason=reasoning.thesis)
@@ -512,6 +709,9 @@ def generate_ict_trade_plan(analysis: BrainAnalysis) -> dict:
             "ob_active": reasoning.ob_active,
             "location": reasoning.location,
         }
+        plan["setup_fingerprint"] = fingerprint
+        plan["short_reason"] = short_reason
+        plan["reused_existing_plan"] = False
         _persist_ict_plan(plan, reasoning, sessions_ranges, recent_sweep, dealing_range)
         # Also persist ICT observations even for WAIT (the detections are real)
         with SessionLocal() as session:
@@ -641,6 +841,9 @@ def generate_ict_trade_plan(analysis: BrainAnalysis) -> dict:
             "location": reasoning.location,
             "sessions": [{"name": s.name, "high": s.high, "low": s.low, "is_dst": s.is_dst} for s in sessions_ranges],
         },
+        "setup_fingerprint": fingerprint,
+        "short_reason": short_reason,
+        "reused_existing_plan": False,
     }
 
     _persist_ict_plan(plan, reasoning, sessions_ranges, recent_sweep, dealing_range)
@@ -742,6 +945,9 @@ def _persist_ict_plan(
             session_context_json=json.dumps(session_ctx, default=str) if session_ctx else None,
             setup_pattern_id=plan_dict.get("setup_pattern_id"),
             plan_engine_version=plan_dict.get("plan_engine_version", ICT_PLAN_VERSION),
+            # Phase 5.7.1: dedup + quality hardening
+            setup_fingerprint=plan_dict.get("setup_fingerprint"),
+            short_reason=plan_dict.get("short_reason"),
         )
         session.add(plan)
 

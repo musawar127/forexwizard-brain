@@ -101,6 +101,11 @@ type Plan = {
     sessions?: Array<{ name: string; high: number; low: number; is_dst: boolean }>;
   } | null;
   setup_pattern_id: string | null;
+  // Phase 5.7.1: dedup + quality hardening
+  setup_fingerprint: string | null;
+  short_reason: string | null;
+  reused_existing_plan: boolean;
+  reused_reason: string | null;
 };
 
 type LifecycleEvent = {
@@ -151,6 +156,13 @@ type PerformanceResponse = {
   by_decision: Record<string, number>;
   by_plan_status: Record<string, number>;
   by_lifecycle_state: Record<string, number>;
+  by_engine_version: Record<string, number>;
+  version_display: string; // "ict-plan-v0.1" | "trade-plan-v0.1" | "MIXED"
+  wait_count: number;
+  actionable_buy_count: number;
+  actionable_sell_count: number;
+  no_trade_count: number;
+  actionable_total: number;
   outcome_summary: {
     total_outcomes_tracked: number;
     entry_touched_count: number;
@@ -352,8 +364,23 @@ export default function TradePlanPage() {
               <span className="mini-chip">{plan.lifecycle_state}</span>
               <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted)" }}>
                 Plan ID: {plan.plan_id} · v{plan.plan_version}
+                {plan.plan_engine_version && (
+                  <span style={{ color: "var(--accent)", marginLeft: 6 }}>
+                    [{plan.plan_engine_version}]
+                  </span>
+                )}
               </span>
             </div>
+
+            {/* Phase 5.7.1: dedup indicator */}
+            {plan.reused_existing_plan && (
+              <div className="panel" style={{ marginBottom: 12, background: "#0d131b", borderLeft: "3px solid var(--yellow)" }}>
+                <div className="panel-kicker" style={{ color: "var(--yellow)" }}>REUSED EXISTING PLAN</div>
+                <p style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>
+                  {plan.reused_reason || "Market state unchanged — existing plan returned, no duplicate inserted."}
+                </p>
+              </div>
+            )}
 
             <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 12 }}>
               Created {fmtTs(plan.created_at)} · Market timestamp {fmtTs(plan.market_timestamp)} ·
@@ -612,10 +639,12 @@ export default function TradePlanPage() {
         )}
       </section>
 
-      {/* Position sizing */}
-      <section className="panel" style={{ marginTop: 12 }}>
-        <div className="panel-kicker">POSITION SIZING (OPTIONAL)</div>
-        <h2>Calculate lot size</h2>
+      {/* Position sizing — collapsed, moved below history per Phase 5.7.1 UI priority */}
+      <details className="panel" style={{ marginTop: 12 }}>
+        <summary style={{ cursor: "pointer", fontSize: 11, fontWeight: 700, color: "var(--muted)" }}>
+          ▸ Optional position sizing (collapsed — not the main feature)
+        </summary>
+        <div className="panel-kicker" style={{ marginTop: 8 }}>OPTIONAL — CALCULATE LOT SIZE</div>
         <p style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>
           Provide your account equity, risk %, and SL distance. Requires broker XAUUSD contract spec
           (XAUUSD_CONTRACT_SIZE / XAUUSD_TICK_SIZE / XAUUSD_TICK_VALUE) to be configured on the backend.
@@ -674,7 +703,7 @@ export default function TradePlanPage() {
 
         {posResult && (
           <div className="panel" style={{ marginTop: 12, background: "#0d131b" }}>
-            <div className="panel-kicker">RESULT</div>
+            <div className="panel-kicker">POSITION SIZE RESULT</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8, fontSize: 11 }}>
               <div>
                 <span>Status:</span>
@@ -708,39 +737,73 @@ export default function TradePlanPage() {
             )}
           </div>
         )}
-      </section>
+      </details>
 
-      {/* Performance */}
+      {/* Performance — Phase 5.7.1: WAIT separated from actionable */}
       {perf && (
         <section className="panel" style={{ marginTop: 12 }}>
-          <div className="panel-kicker">PERFORMANCE (ALL PLANS)</div>
+          <div className="panel-kicker">PERFORMANCE</div>
           <h2>Aggregate metrics</h2>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 12, fontSize: 11 }}>
+          {/* Version display — MIXED if both engine versions present */}
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4, marginBottom: 8 }}>
+            <strong>Version:</strong> <span style={{ color: perf.version_display === "MIXED" ? "var(--yellow)" : "var(--accent)" }}>{perf.version_display}</span>
+            {Object.keys(perf.by_engine_version || {}).length > 1 && (
+              <span style={{ marginLeft: 8 }}>
+                ({Object.entries(perf.by_engine_version).map(([v, c]) => `${v}: ${c}`).join(", ")})
+              </span>
+            )}
+          </div>
+          {/* Phase 5.7.1: WAIT separated from actionable BUY/SELL */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, marginTop: 8, fontSize: 11 }}>
             <div>
-              <span>Total plans:</span>
-              <strong>{perf.total_plans}</strong>
+              <span style={{ color: "var(--muted)" }}>WAIT decisions:</span>
+              <strong style={{ color: "var(--muted)" }}>{perf.wait_count}</strong>
             </div>
             <div>
-              <span>Entries touched:</span>
-              <strong>{perf.outcome_summary.entry_touched_count}</strong>
+              <span style={{ color: "var(--green)" }}>Actionable BUY:</span>
+              <strong style={{ color: "var(--green)" }}>{perf.actionable_buy_count}</strong>
             </div>
             <div>
-              <span>SL before target:</span>
-              <strong>{perf.outcome_summary.sl_before_target_count}</strong>
+              <span style={{ color: "var(--red)" }}>Actionable SELL:</span>
+              <strong style={{ color: "var(--red)" }}>{perf.actionable_sell_count}</strong>
             </div>
             <div>
-              <span>TP1 reached:</span>
-              <strong>{perf.outcome_summary.tp1_reached}</strong>
-            </div>
-            <div>
-              <span>TP4 reached:</span>
-              <strong>{perf.outcome_summary.tp4_reached}</strong>
-            </div>
-            <div>
-              <span>Plan version:</span>
-              <strong>{perf.plan_version}</strong>
+              <span>Actionable total:</span>
+              <strong>{perf.actionable_total}</strong>
             </div>
           </div>
+          <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 6 }}>
+            WAIT decisions are informational market-state records, not trading performance. Outcome metrics below track only actionable BUY/SELL plans.
+          </div>
+          {/* Outcome summary — only actionable plans */}
+          {perf.actionable_total > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 12, fontSize: 11, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+              <div>
+                <span>Entries touched:</span>
+                <strong>{perf.outcome_summary.entry_touched_count}</strong>
+              </div>
+              <div>
+                <span>SL before target:</span>
+                <strong>{perf.outcome_summary.sl_before_target_count}</strong>
+              </div>
+              <div>
+                <span>TP1 reached:</span>
+                <strong>{perf.outcome_summary.tp1_reached}</strong>
+              </div>
+              <div>
+                <span>TP4 reached:</span>
+                <strong>{perf.outcome_summary.tp4_reached}</strong>
+              </div>
+              <div>
+                <span>Outcomes tracked:</span>
+                <strong>{perf.outcome_summary.total_outcomes_tracked}</strong>
+              </div>
+              <div>
+                <span>Total plans:</span>
+                <strong>{perf.total_plans}</strong>
+              </div>
+            </div>
+          )}
         </section>
       )}
 
@@ -756,10 +819,11 @@ export default function TradePlanPage() {
                 <th>Created</th>
                 <th>Decision</th>
                 <th>Status</th>
-                <th>Lifecycle</th>
+                <th>Short Reason / Thesis</th>
                 <th>Entry ref</th>
                 <th>SL</th>
-                <th>TP4</th>
+                <th>MAX obj</th>
+                <th>Engine</th>
               </tr>
             </thead>
             <tbody>
@@ -769,10 +833,11 @@ export default function TradePlanPage() {
                   <td>{fmtTs(p.created_at)}</td>
                   <td style={{ color: DECISION_COLORS[p.brain_decision] || "var(--muted)" }}>{p.brain_decision}</td>
                   <td style={{ color: STATUS_COLORS[p.plan_status] || "var(--muted)" }}>{p.plan_status}</td>
-                  <td>{p.lifecycle_state}</td>
+                  <td style={{ fontSize: 9, color: "var(--muted)" }}>{p.short_reason || p.setup_thesis || "—"}</td>
                   <td>{fmtPrice(p.entry_reference)}</td>
                   <td>{fmtPrice(p.stop_loss)}</td>
-                  <td>{fmtPrice(p.tp4)}</td>
+                  <td>{fmtPrice(p.max_objective ?? p.tp4)}</td>
+                  <td style={{ fontSize: 8, color: "var(--accent)" }}>{p.plan_engine_version || "—"}</td>
                 </tr>
               ))}
             </tbody>
