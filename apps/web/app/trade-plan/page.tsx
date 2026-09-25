@@ -50,14 +50,19 @@ type Plan = {
   entry_high: number | null;
   entry_type: string | null;
   entry_reference: number | null;
+  preferred_entry: number | null; // Phase 5.7
+  entry_reason?: string | null; // Phase 5.7
   stop_loss: number | null;
   invalidation_level: number | null;
   invalidation_reason: string | null;
+  structural_invalidation: number | null; // Phase 5.7
   sl_distance: number | null;
   tp1: number | null;
   tp2: number | null;
   tp3: number | null;
   tp4: number | null;
+  max_objective: number | null; // Phase 5.7
+  max_objective_reason: string | null; // Phase 5.7
   tp1_reason: string | null;
   tp2_reason: string | null;
   tp3_reason: string | null;
@@ -74,10 +79,28 @@ type Plan = {
   management_instructions: string | null;
   plan_status: string;
   plan_version: string;
+  plan_engine_version: string | null; // Phase 5.7: 'trade-plan-v0.1' or 'ict-plan-v0.1'
   historical_similarity_run_id: string | null;
   historical_context: string | null;
   lifecycle_state: string;
   final_status: string | null;
+  // Phase 5.7 ICT extensions
+  setup_thesis: string | null;
+  for_evidence: Array<{ kind: string; timeframe: string | null; description: string; bullish_or_bearish: string; confidence: number }> | null;
+  against_evidence: Array<{ kind: string; timeframe: string | null; description: string; bullish_or_bearish: string; confidence: number }> | null;
+  session_context: {
+    active_sessions: string[];
+    htf_trend: string;
+    m15_trend: string;
+    liquidity_swept: boolean;
+    sweep_direction: string | null;
+    displacement_confirmed: boolean;
+    fvg_active: boolean;
+    ob_active: boolean;
+    location: string;
+    sessions?: Array<{ name: string; high: number; low: number; is_dst: boolean }>;
+  } | null;
+  setup_pattern_id: string | null;
 };
 
 type LifecycleEvent = {
@@ -435,6 +458,83 @@ export default function TradePlanPage() {
                     probability_calibrated remains FALSE.
                   </p>
                 </div>
+
+                {/* Phase 5.7: ICT/SMC strategy reasoning */}
+                {plan.plan_engine_version === "ict-plan-v0.1" && plan.setup_thesis && (
+                  <div className="panel" style={{ marginTop: 12, background: "#0d131b", borderLeft: "3px solid var(--accent)" }}>
+                    <div className="panel-kicker">PHASE 5.7 — ICT/SMC THESIS</div>
+                    <p style={{ fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>{plan.setup_thesis}</p>
+
+                    {plan.max_objective && (
+                      <div style={{ marginTop: 8, fontSize: 12 }}>
+                        <strong>MAX OBJECTIVE:</strong> <span style={{ color: "var(--accent)" }}>{fmtPrice(plan.max_objective)}</span>
+                        {plan.max_objective_reason && (
+                          <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: 8 }}>
+                            ({plan.max_objective_reason})
+                          </span>
+                        )}
+                        <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 4 }}>
+                          MAX OBJECTIVE is the highest structurally justified objective — not a guaranteed profit target.
+                        </div>
+                      </div>
+                    )}
+
+                    {/* FOR evidence */}
+                    {plan.for_evidence && plan.for_evidence.length > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        <div style={{ fontSize: 10, color: "var(--green)", fontWeight: 700 }}>FOR</div>
+                        <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
+                          {plan.for_evidence.map((e, i) => (
+                            <li key={i}>
+                              <strong>{e.kind}</strong>
+                              {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
+                              <span style={{ color: "var(--muted)", marginLeft: 4 }}>(conf {e.confidence.toFixed(0)})</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* AGAINST evidence */}
+                    {plan.against_evidence && plan.against_evidence.length > 0 && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 10, color: "var(--red)", fontWeight: 700 }}>AGAINST</div>
+                        <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
+                          {plan.against_evidence.map((e, i) => (
+                            <li key={i}>
+                              <strong>{e.kind}</strong>
+                              {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Session context */}
+                    {plan.session_context && (
+                      <div style={{ marginTop: 12, fontSize: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+                        <strong>SESSION CONTEXT:</strong>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 4 }}>
+                          <div><span>HTF trend:</span> <strong style={{ color: plan.session_context.htf_trend === "BULLISH" ? "var(--green)" : plan.session_context.htf_trend === "BEARISH" ? "var(--red)" : "var(--muted)" }}>{plan.session_context.htf_trend}</strong></div>
+                          <div><span>M15 trend:</span> <strong>{plan.session_context.m15_trend}</strong></div>
+                          <div><span>Location:</span> <strong>{plan.session_context.location}</strong></div>
+                          <div><span>Liquidity swept:</span> <strong>{plan.session_context.liquidity_swept ? "YES" : "no"}</strong></div>
+                          <div><span>Sweep dir:</span> <strong>{plan.session_context.sweep_direction || "—"}</strong></div>
+                          <div><span>Displacement:</span> <strong>{plan.session_context.displacement_confirmed ? "confirmed" : "—"}</strong></div>
+                          <div><span>FVG active:</span> <strong>{plan.session_context.fvg_active ? "YES" : "no"}</strong></div>
+                          <div><span>OB active:</span> <strong>{plan.session_context.ob_active ? "YES" : "no"}</strong></div>
+                          <div><span>Sessions:</span> <strong>{plan.session_context.active_sessions.join(", ") || "—"}</strong></div>
+                        </div>
+                      </div>
+                    )}
+
+                    {plan.setup_pattern_id && (
+                      <div style={{ marginTop: 8, fontSize: 9, color: "var(--muted)" }}>
+                        Pattern tracked: {plan.setup_pattern_id} (forward-validation prospective)
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {detail?.outcome && (
                   <div className="panel" style={{ marginTop: 12 }}>

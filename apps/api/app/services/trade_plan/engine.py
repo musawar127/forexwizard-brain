@@ -467,6 +467,27 @@ def get_performance() -> dict:
 
 
 def _plan_row_to_dict(plan: TradePlan) -> dict:
+    import json as _json
+    # Parse Phase 5.7 ICT extension fields if present
+    for_ev = None
+    against_ev = None
+    session_ctx = None
+    if plan.for_evidence_json:
+        try:
+            for_ev = _json.loads(plan.for_evidence_json)
+        except Exception:
+            for_ev = None
+    if plan.against_evidence_json:
+        try:
+            against_ev = _json.loads(plan.against_evidence_json)
+        except Exception:
+            against_ev = None
+    if plan.session_context_json:
+        try:
+            session_ctx = _json.loads(plan.session_context_json)
+        except Exception:
+            session_ctx = None
+
     return {
         "plan": {
             "plan_id": plan.plan_id,
@@ -479,11 +500,16 @@ def _plan_row_to_dict(plan: TradePlan) -> dict:
             "entry_high": plan.entry_high,
             "entry_type": plan.entry_type,
             "entry_reference": plan.entry_reference,
+            "preferred_entry": plan.preferred_entry,  # Phase 5.7
+            "entry_reason": getattr(plan, "entry_reason", None),  # may not exist as a column; safe via getattr
             "stop_loss": plan.stop_loss,
             "invalidation_level": plan.invalidation_level,
             "invalidation_reason": plan.invalidation_reason,
+            "structural_invalidation": plan.structural_invalidation,  # Phase 5.7
             "sl_distance": plan.sl_distance,
             "tp1": plan.tp1, "tp2": plan.tp2, "tp3": plan.tp3, "tp4": plan.tp4,
+            "max_objective": plan.max_objective,  # Phase 5.7
+            "max_objective_reason": plan.max_objective_reason,  # Phase 5.7
             "tp1_reason": plan.tp1_reason, "tp2_reason": plan.tp2_reason,
             "tp3_reason": plan.tp3_reason, "tp4_reason": plan.tp4_reason,
             "risk_distance": plan.risk_distance,
@@ -494,10 +520,17 @@ def _plan_row_to_dict(plan: TradePlan) -> dict:
             "management_instructions": plan.management_instructions,
             "plan_status": plan.plan_status,
             "plan_version": plan.plan_version,
+            "plan_engine_version": plan.plan_engine_version,  # Phase 5.7
             "historical_similarity_run_id": plan.historical_similarity_run_id,
             "historical_context": plan.historical_context,
             "lifecycle_state": plan.lifecycle_state,
             "final_status": plan.final_status,
+            # Phase 5.7 ICT extensions
+            "setup_thesis": plan.setup_thesis,
+            "for_evidence": for_ev,
+            "against_evidence": against_ev,
+            "session_context": session_ctx,
+            "setup_pattern_id": plan.setup_pattern_id,
         }
     }
 

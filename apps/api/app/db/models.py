@@ -813,6 +813,22 @@ class TradePlan(Base):
     # COMPLETED_TP1 / COMPLETED_TP2 / COMPLETED_TP3 / COMPLETED_TP4 / STOPPED / EXPIRED / INVALIDATED
     final_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
+    # Phase 5.7: ICT/SMC strategy reasoning extensions (nullable so Phase 5.6
+    # plans remain valid). ICT-driven plans populate these fields; classic
+    # Phase 5.6 plans leave them NULL.
+    setup_thesis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    for_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    against_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structural_invalidation: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_objective: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_objective_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    preferred_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session_context_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    setup_pattern_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    plan_engine_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # plan_engine_version distinguishes Phase 5.6 ('trade-plan-v0.1')
+    # from Phase 5.7 ICT-driven plans ('ict-plan-v0.1').
+
 
 class TradePlanLifecycleEvent(Base):
     """Phase 5.6: immutable record of every lifecycle transition for a plan.
@@ -874,3 +890,205 @@ class TradePlanOutcome(Base):
     time_to_tp4_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     final_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+
+
+# ============================================================
+# Phase 5.7: ICT/SMC strategy reasoning brain
+# ============================================================
+# These tables store detected ICT/SMC concepts (structures, liquidity,
+# FVGs, OBs) and the strategy knowledge dictionary. Pattern statistics
+# are tracked prospectively (no historical backfill) so the system can
+# learn which setups actually work over time without fabricating
+# historical live signals.
+# ============================================================
+
+
+class StrategyKnowledge(Base):
+    """Phase 5.7: ICT/SMC concept knowledge dictionary.
+
+    Separates CONCEPT knowledge (definitions, detection rules) from LIVE
+    market observations. The knowledge table is the dictionary; the
+    ict_structures / ict_liquidity_levels / etc. tables hold live
+    observations derived from market data.
+    """
+
+    __tablename__ = "ict_strategy_knowledge"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)  # MARKET_STRUCTURE / LIQUIDITY / ICT_SMC / SESSIONS
+    definition: Mapped[str] = mapped_column(Text)
+    detection_rule_version: Mapped[str] = mapped_column(String(16), default="v0.1")
+    source: Mapped[str] = mapped_column(String(64), default="ICT/SMC standard")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class IctStructure(Base):
+    """Phase 5.7: detected market structure (swing / BOS / CHoCH / MSS / HH-HL-LH-LL)."""
+
+    __tablename__ = "ict_structures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True, default="XAU/USD")
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)  # candle timestamp
+    price: Mapped[float] = mapped_column(Float)
+    structure_type: Mapped[str] = mapped_column(String(16), index=True)
+    # SWING_HIGH / SWING_LOW / HH / HL / LH / LL / BOS / CHoCH / MSS
+    direction: Mapped[str | None] = mapped_column(String(8), nullable=True)  # BULLISH / BEARISH (for BOS/CHoCH/MSS)
+    quality: Mapped[float] = mapped_column(Float, default=50.0)  # 0..100
+    # For BOS/CHoCH/MSS: the swing level that was broken
+    broken_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Invalidation: the level that would invalidate this structure
+    invalidation: Mapped[float | None] = mapped_column(Float, nullable=True)
+    feature_version: Mapped[str] = mapped_column(String(16), default="structure-v0.1")
+
+
+class IctLiquidityLevel(Base):
+    """Phase 5.7: candidate liquidity pool levels."""
+
+    __tablename__ = "ict_liquidity_levels"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True, default="XAU/USD")
+    price: Mapped[float] = mapped_column(Float, index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    # EQUAL_HIGHS / EQUAL_LOWS / PDH / PDL / PWH / PWL / SESSION_HIGH / SESSION_LOW / SWING_HIGH / SWING_LOW
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    session: Mapped[str | None] = mapped_column(String(16), nullable=True)  # ASIA / LONDON / NEW_YORK
+    confidence: Mapped[float] = mapped_column(Float, default=50.0)
+    swept: Mapped[bool] = mapped_column(Boolean, default=False)
+    swept_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    feature_version: Mapped[str] = mapped_column(String(16), default="liquidity-v0.1")
+
+
+class IctLiquiditySweep(Base):
+    """Phase 5.7: liquidity sweep events."""
+
+    __tablename__ = "ict_liquidity_sweeps"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True, default="XAU/USD")
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    level: Mapped[float] = mapped_column(Float)
+    level_kind: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(String(32), index=True)  # BUY_SIDE_SWEEP / SELL_SIDE_SWEEP
+    reaction_magnitude: Mapped[float] = mapped_column(Float, default=0.0)
+    reaction_atr_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    failed: Mapped[bool] = mapped_column(Boolean, default=False)
+    feature_version: Mapped[str] = mapped_column(String(16), default="liquidity-v0.1")
+
+
+class IctFvg(Base):
+    """Phase 5.7: Fair Value Gap detection."""
+
+    __tablename__ = "ict_fvgs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True, default="XAU/USD")
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    direction: Mapped[str] = mapped_column(String(8), index=True)  # BULLISH / BEARISH
+    upper: Mapped[float] = mapped_column(Float)
+    lower: Mapped[float] = mapped_column(Float)
+    midpoint: Mapped[float] = mapped_column(Float)
+    mitigated: Mapped[bool] = mapped_column(Boolean, default=False)
+    fully_filled: Mapped[bool] = mapped_column(Boolean, default=False)
+    invalidated: Mapped[bool] = mapped_column(Boolean, default=False)
+    mitigated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    feature_version: Mapped[str] = mapped_column(String(16), default="fvg-v0.1")
+
+
+class IctOrderBlock(Base):
+    """Phase 5.7: Order Block detection with quality gates."""
+
+    __tablename__ = "ict_order_blocks"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(32), index=True, default="XAU/USD")
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)  # OB origin timestamp
+    direction: Mapped[str] = mapped_column(String(8), index=True)  # BULLISH / BEARISH
+    upper: Mapped[float] = mapped_column(Float)
+    lower: Mapped[float] = mapped_column(Float)
+    midpoint: Mapped[float] = mapped_column(Float)
+    quality: Mapped[float] = mapped_column(Float, default=0.0)
+    bos_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mitigated: Mapped[bool] = mapped_column(Boolean, default=False)
+    mitigated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated: Mapped[bool] = mapped_column(Boolean, default=False)
+    feature_version: Mapped[str] = mapped_column(String(16), default="ob-v0.1")
+
+
+class IctPatternStat(Base):
+    """Phase 5.7: pattern outcome tracking (prospective only).
+
+    Each detected setup pattern is tracked prospectively. When a setup
+    is generated with a specific pattern signature (e.g. 'sell-side sweep
+    + bullish MSS + M15 FVG + H1 discount'), a pattern_stat row tracks
+    future behavior: MFE/MAE/TP1/TP2/TP3/MAX/SL.
+
+    NEVER backfilled — only patterns detected AFTER this row was created
+    are tracked. Do not fabricate historical live signals.
+    """
+
+    __tablename__ = "ict_pattern_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    pattern_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # "PATTERN-<uuid8>"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # Pattern signature: a JSON describing the conditions
+    # e.g. {"htf_trend": "BULLISH", "sweep": "SELL_SIDE", "m15_event": "MSS",
+    #       "fvg": "BULLISH", "location": "DISCOUNT"}
+    signature_json: Mapped[str] = mapped_column(Text)
+    # Optional friendly name
+    friendly_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Forward sample size + outcome counts
+    forward_sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    tp1_reached: Mapped[int] = mapped_column(Integer, default=0)
+    tp2_reached: Mapped[int] = mapped_column(Integer, default=0)
+    tp3_reached: Mapped[int] = mapped_column(Integer, default=0)
+    max_objective_reached: Mapped[int] = mapped_column(Integer, default=0)
+    sl_reached: Mapped[int] = mapped_column(Integer, default=0)
+    avg_mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="EXPERIMENTAL")
+    # EXPERIMENTAL / UNDER_REVIEW / REJECTED / VALIDATED_CANDIDATE
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class IctCandidatePattern(Base):
+    """Phase 5.7: candidate patterns discovered by the Brain.
+
+    Status flow:
+      EXPERIMENTAL -> UNDER_REVIEW -> (VALIDATED_CANDIDATE | REJECTED)
+
+    NEVER promoted into production BUY/SELL engine automatically. Phase 6
+    will handle validated integration later.
+    """
+
+    __tablename__ = "ict_candidate_patterns"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    candidate_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # "PATTERN-CANDIDATE-001"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    friendly_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Conditions JSON
+    conditions_json: Mapped[str] = mapped_column(Text)
+    # Sample sizes
+    historical_sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    forward_sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    # Outcome metrics
+    historical_tp1_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    forward_tp1_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Status
+    status: Mapped[str] = mapped_column(String(32), default="EXPERIMENTAL", index=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)

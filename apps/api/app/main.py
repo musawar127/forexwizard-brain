@@ -55,6 +55,13 @@ from app.services.trade_plan import (
     evaluate_live_plans as trade_plan_evaluate_live,
     trade_plan_validation_loop,
 )
+# Phase 5.7: ICT/SMC strategy reasoning brain
+from app.services.ict import (
+    ICT_PLAN_VERSION,
+    generate_ict_trade_plan,
+    seed_knowledge as ict_seed_knowledge,
+    list_knowledge as ict_list_knowledge,
+)
 from app.services.catchup import (
     get_catchup_status,
     get_catchup_job,
@@ -878,14 +885,133 @@ async def api_trade_plan_position_size(payload: PositionSizeRequest):
 async def api_trade_plan_generate():
     """Generate a fresh trade plan from the current Brain analysis.
 
-    The Brain's BUY/SELL/WAIT decision is INPUT — this endpoint never
-    overrides it. WAIT -> plan_status=NO_TRADE.
-
-    Returns the freshly persisted plan (immutable row in trade_plans).
+    Phase 5.7: now uses the ICT/SMC reasoning engine when available. The
+    Brain's BUY/SELL/WAIT decision is INPUT and never overridden. WAIT
+    -> plan_status=NO_TRADE.
     """
     if state.analysis is None:
         return {"plan": None, "reason": "brain analysis not yet available"}
-    return generate_trade_plan(state.analysis)
+    # Phase 5.7: use ICT engine by default
+    return generate_ict_trade_plan(state.analysis)
+
+
+# ============================================================
+# Phase 5.7: ICT/SMC strategy reasoning endpoints
+# ============================================================
+
+@app.on_event("startup")
+async def _seed_ict_knowledge():
+    """Seed the strategy knowledge dictionary on startup (idempotent)."""
+    try:
+        from app.db.session import SessionLocal
+        with SessionLocal() as session:
+            inserted = ict_seed_knowledge(session)
+            if inserted > 0:
+                import logging
+                logging.getLogger("forexwizard").info(
+                    "ICT knowledge seeded: %d new concepts", inserted
+                )
+    except Exception as exc:
+        import logging
+        logging.getLogger("forexwizard").warning("ICT knowledge seed failed: %s", exc)
+
+
+@app.get("/api/ict/knowledge")
+async def api_ict_knowledge():
+    """List the strategy concept dictionary (HH/HL/LH/LL, BOS/CHoCH/MSS,
+    liquidity, FVG, OB, premium/discount, sessions, etc.)."""
+    from app.db.session import SessionLocal
+    with SessionLocal() as session:
+        return {"concepts": ict_list_knowledge(session)}
+
+
+@app.get("/api/ict/analysis")
+async def api_ict_analysis():
+    """Return a snapshot of the latest ICT/SMC detection across timeframes.
+
+    Useful for chart overlays and debugging the reasoner. Returns the most
+    recent N structures, liquidity levels, sweeps, FVGs, OBs.
+    """
+    from app.db.session import SessionLocal
+    from sqlalchemy import select
+    from app.db.models import (
+        IctStructure, IctLiquidityLevel, IctLiquiditySweep,
+        IctFvg, IctOrderBlock, IctPatternStat,
+    )
+    out: dict = {"structures": [], "liquidity_levels": [], "liquidity_sweeps": [], "fvgs": [], "order_blocks": [], "pattern_stats": []}
+    with SessionLocal() as session:
+        # Latest 50 structures
+        structs = session.execute(
+            select(IctStructure).order_by(IctStructure.detected_at.desc()).limit(50)
+        ).scalars().all()
+        out["structures"] = [
+            {
+                "timeframe": s.timeframe, "timestamp": s.timestamp.isoformat() if s.timestamp else None,
+                "price": s.price, "structure_type": s.structure_type,
+                "direction": s.direction, "quality": s.quality,
+                "broken_level": s.broken_level, "invalidation": s.invalidation,
+            } for s in structs
+        ]
+        # Latest 30 liquidity levels (not swept)
+        levels = session.execute(
+            select(IctLiquidityLevel).where(IctLiquidityLevel.swept == False).order_by(IctLiquidityLevel.detected_at.desc()).limit(30)
+        ).scalars().all()
+        out["liquidity_levels"] = [
+            {
+                "price": l.price, "kind": l.kind, "session": l.session,
+                "confidence": l.confidence, "swept": l.swept,
+            } for l in levels
+        ]
+        # Latest 10 sweeps
+        sweeps = session.execute(
+            select(IctLiquiditySweep).order_by(IctLiquiditySweep.detected_at.desc()).limit(10)
+        ).scalars().all()
+        out["liquidity_sweeps"] = [
+            {
+                "timestamp": s.timestamp.isoformat() if s.timestamp else None,
+                "level": s.level, "level_kind": s.level_kind, "direction": s.direction,
+                "reaction_magnitude": s.reaction_magnitude,
+                "reaction_atr_multiple": s.reaction_atr_multiple,
+                "failed": s.failed,
+            } for s in sweeps
+        ]
+        # Latest 20 active FVGs (not invalidated, not fully filled)
+        fvgs = session.execute(
+            select(IctFvg).where(IctFvg.invalidated == False).order_by(IctFvg.detected_at.desc()).limit(20)
+        ).scalars().all()
+        out["fvgs"] = [
+            {
+                "timeframe": f.timeframe, "timestamp": f.timestamp.isoformat() if f.timestamp else None,
+                "direction": f.direction, "upper": f.upper, "lower": f.lower, "midpoint": f.midpoint,
+                "mitigated": f.mitigated, "fully_filled": f.fully_filled,
+            } for f in fvgs
+        ]
+        # Latest 20 active OBs
+        obs = session.execute(
+            select(IctOrderBlock).where(IctOrderBlock.invalidated == False).order_by(IctOrderBlock.detected_at.desc()).limit(20)
+        ).scalars().all()
+        out["order_blocks"] = [
+            {
+                "timeframe": o.timeframe, "timestamp": o.timestamp.isoformat() if o.timestamp else None,
+                "direction": o.direction, "upper": o.upper, "lower": o.lower, "midpoint": o.midpoint,
+                "quality": o.quality, "mitigated": o.mitigated,
+            } for o in obs
+        ]
+        # Pattern stats summary
+        ps = session.execute(
+            select(IctPatternStat).order_by(IctPatternStat.created_at.desc()).limit(10)
+        ).scalars().all()
+        out["pattern_stats"] = [
+            {
+                "pattern_id": p.pattern_id, "created_at": p.created_at.isoformat() if p.created_at else None,
+                "friendly_name": p.friendly_name,
+                "forward_sample_size": p.forward_sample_size,
+                "tp1_reached": p.tp1_reached, "tp2_reached": p.tp2_reached,
+                "tp3_reached": p.tp3_reached, "max_objective_reached": p.max_objective_reached,
+                "sl_reached": p.sl_reached, "status": p.status,
+            } for p in ps
+        ]
+    return out
 
 
 # IMPORTANT: the {plan_id} wildcard route MUST come AFTER all the
