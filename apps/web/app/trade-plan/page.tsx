@@ -372,6 +372,69 @@ export default function TradePlanPage() {
               </div>
             )}
 
+            {/* Phase 5.7: ICT/SMC thesis — always shown for ICT plans (even WAIT) */}
+            {plan.plan_engine_version === "ict-plan-v0.1" && plan.setup_thesis && (
+              <div className="panel" style={{ marginTop: 12, background: "#0d131b", borderLeft: "3px solid var(--accent)" }}>
+                <div className="panel-kicker">PHASE 5.7 — ICT/SMC THESIS</div>
+                <p style={{ fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>{plan.setup_thesis}</p>
+
+                {/* FOR evidence */}
+                {plan.for_evidence && plan.for_evidence.length > 0 && (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 10, color: "var(--green)", fontWeight: 700 }}>FOR</div>
+                    <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
+                      {plan.for_evidence.map((e, i) => (
+                        <li key={i}>
+                          <strong>{e.kind}</strong>
+                          {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
+                          <span style={{ color: "var(--muted)", marginLeft: 4 }}>(conf {e.confidence.toFixed(0)})</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* AGAINST evidence */}
+                {plan.against_evidence && plan.against_evidence.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ fontSize: 10, color: "var(--red)", fontWeight: 700 }}>AGAINST</div>
+                    <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
+                      {plan.against_evidence.map((e, i) => (
+                        <li key={i}>
+                          <strong>{e.kind}</strong>
+                          {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Session context */}
+                {plan.session_context && (
+                  <div style={{ marginTop: 12, fontSize: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+                    <strong>SESSION CONTEXT:</strong>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 4 }}>
+                      <div><span>HTF trend:</span> <strong style={{ color: plan.session_context.htf_trend === "BULLISH" ? "var(--green)" : plan.session_context.htf_trend === "BEARISH" ? "var(--red)" : "var(--muted)" }}>{plan.session_context.htf_trend}</strong></div>
+                      <div><span>M15 trend:</span> <strong>{plan.session_context.m15_trend}</strong></div>
+                      <div><span>Location:</span> <strong>{plan.session_context.location}</strong></div>
+                      <div><span>Liquidity swept:</span> <strong>{plan.session_context.liquidity_swept ? "YES" : "no"}</strong></div>
+                      <div><span>Sweep dir:</span> <strong>{plan.session_context.sweep_direction || "—"}</strong></div>
+                      <div><span>Displacement:</span> <strong>{plan.session_context.displacement_confirmed ? "confirmed" : "—"}</strong></div>
+                      <div><span>FVG active:</span> <strong>{plan.session_context.fvg_active ? "YES" : "no"}</strong></div>
+                      <div><span>OB active:</span> <strong>{plan.session_context.ob_active ? "YES" : "no"}</strong></div>
+                      <div><span>Sessions:</span> <strong>{plan.session_context.active_sessions.join(", ") || "—"}</strong></div>
+                    </div>
+                  </div>
+                )}
+
+                {plan.setup_pattern_id && (
+                  <div style={{ marginTop: 8, fontSize: 9, color: "var(--muted)" }}>
+                    Pattern tracked: {plan.setup_pattern_id} (forward-validation prospective)
+                  </div>
+                )}
+              </div>
+            )}
+
             {isTradeable && (
               <>
                 <div className="two-col">
@@ -459,80 +522,19 @@ export default function TradePlanPage() {
                   </p>
                 </div>
 
-                {/* Phase 5.7: ICT/SMC strategy reasoning */}
-                {plan.plan_engine_version === "ict-plan-v0.1" && plan.setup_thesis && (
+                {/* Phase 5.7: MAX OBJECTIVE (only for actionable ICT plans) */}
+                {plan.plan_engine_version === "ict-plan-v0.1" && plan.max_objective && (
                   <div className="panel" style={{ marginTop: 12, background: "#0d131b", borderLeft: "3px solid var(--accent)" }}>
-                    <div className="panel-kicker">PHASE 5.7 — ICT/SMC THESIS</div>
-                    <p style={{ fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>{plan.setup_thesis}</p>
-
-                    {plan.max_objective && (
-                      <div style={{ marginTop: 8, fontSize: 12 }}>
-                        <strong>MAX OBJECTIVE:</strong> <span style={{ color: "var(--accent)" }}>{fmtPrice(plan.max_objective)}</span>
-                        {plan.max_objective_reason && (
-                          <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: 8 }}>
-                            ({plan.max_objective_reason})
-                          </span>
-                        )}
-                        <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 4 }}>
-                          MAX OBJECTIVE is the highest structurally justified objective — not a guaranteed profit target.
-                        </div>
-                      </div>
+                    <div className="panel-kicker">MAX OBJECTIVE</div>
+                    <strong style={{ fontSize: 18, color: "var(--accent)" }}>{fmtPrice(plan.max_objective)}</strong>
+                    {plan.max_objective_reason && (
+                      <p style={{ fontSize: 9, color: "var(--muted)", marginTop: 4 }}>
+                        {plan.max_objective_reason}
+                      </p>
                     )}
-
-                    {/* FOR evidence */}
-                    {plan.for_evidence && plan.for_evidence.length > 0 && (
-                      <div style={{ marginTop: 12 }}>
-                        <div style={{ fontSize: 10, color: "var(--green)", fontWeight: 700 }}>FOR</div>
-                        <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
-                          {plan.for_evidence.map((e, i) => (
-                            <li key={i}>
-                              <strong>{e.kind}</strong>
-                              {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
-                              <span style={{ color: "var(--muted)", marginLeft: 4 }}>(conf {e.confidence.toFixed(0)})</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                    {/* AGAINST evidence */}
-                    {plan.against_evidence && plan.against_evidence.length > 0 && (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={{ fontSize: 10, color: "var(--red)", fontWeight: 700 }}>AGAINST</div>
-                        <ul style={{ fontSize: 10, marginTop: 4, paddingLeft: 16 }}>
-                          {plan.against_evidence.map((e, i) => (
-                            <li key={i}>
-                              <strong>{e.kind}</strong>
-                              {e.timeframe && <span style={{ color: "var(--muted)" }}> [{e.timeframe}]</span>}: {e.description}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                    {/* Session context */}
-                    {plan.session_context && (
-                      <div style={{ marginTop: 12, fontSize: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
-                        <strong>SESSION CONTEXT:</strong>
-                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 4 }}>
-                          <div><span>HTF trend:</span> <strong style={{ color: plan.session_context.htf_trend === "BULLISH" ? "var(--green)" : plan.session_context.htf_trend === "BEARISH" ? "var(--red)" : "var(--muted)" }}>{plan.session_context.htf_trend}</strong></div>
-                          <div><span>M15 trend:</span> <strong>{plan.session_context.m15_trend}</strong></div>
-                          <div><span>Location:</span> <strong>{plan.session_context.location}</strong></div>
-                          <div><span>Liquidity swept:</span> <strong>{plan.session_context.liquidity_swept ? "YES" : "no"}</strong></div>
-                          <div><span>Sweep dir:</span> <strong>{plan.session_context.sweep_direction || "—"}</strong></div>
-                          <div><span>Displacement:</span> <strong>{plan.session_context.displacement_confirmed ? "confirmed" : "—"}</strong></div>
-                          <div><span>FVG active:</span> <strong>{plan.session_context.fvg_active ? "YES" : "no"}</strong></div>
-                          <div><span>OB active:</span> <strong>{plan.session_context.ob_active ? "YES" : "no"}</strong></div>
-                          <div><span>Sessions:</span> <strong>{plan.session_context.active_sessions.join(", ") || "—"}</strong></div>
-                        </div>
-                      </div>
-                    )}
-
-                    {plan.setup_pattern_id && (
-                      <div style={{ marginTop: 8, fontSize: 9, color: "var(--muted)" }}>
-                        Pattern tracked: {plan.setup_pattern_id} (forward-validation prospective)
-                      </div>
-                    )}
+                    <p style={{ fontSize: 9, color: "var(--muted)", marginTop: 4 }}>
+                      MAX OBJECTIVE is the highest structurally justified objective — not a guaranteed profit target.
+                    </p>
                   </div>
                 )}
 
